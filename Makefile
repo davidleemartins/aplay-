@@ -1,6 +1,7 @@
 # ©2017-2025 YUICHIRO NAKADA
 
 PROGRAM = $(patsubst %.c,%,$(wildcard *.c))
+HEAD    = $(wildcard *.h)
 
 ifneq (, $(shell which clang))
 CC = clang
@@ -8,10 +9,16 @@ endif
 ifneq (, $(shell which icc))
 CC = icc
 endif
-CFLAGS = -O3 -ffunction-sections -fdata-sections -funroll-loops -finline-functions -ftree-vectorize
-#CFLAGS = -Os -ffunction-sections -fdata-sections -funroll-loops -finline-functions -ftree-vectorize -march=native
+CFLAGS = -O3 -ffunction-sections -fdata-sections -funroll-loops -finline-functions -ftree-vectorize \
+         -Wall -Wextra -Wno-unused-parameter \
+         -Wno-unused-result \
+         -Wno-unused-function \
+         -Wno-unused-variable \
+         -Wno-sign-compare \
+         -Wno-missing-field-initializers \
+         -Wno-aggressive-loop-optimizations \
+         -Wno-stringop-overflow
 LDFLAGS = -lasound -lm -Wl,-s -Wl,--gc-sections
-#LDFLAGS = -lasound -lm -Wl,-s -Wl,-dead_strip
 
 .PHONY: all
 all: $(PROGRAM)

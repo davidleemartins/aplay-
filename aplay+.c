@@ -143,18 +143,12 @@ void apply_crosstalk_cancellation(CrosstalkCancel *xtc, void *buffer, int frames
 			float delayed_left = xtc->delay_buffer[delay_idx];
 			float delayed_right = xtc->delay_buffer[delay_idx + 1];
 
-			float new_left = temp[idx] - xtc->attenuation * delayed_right;
-			float new_right = temp[idx + 1] - xtc->attenuation * delayed_left;
+			float new_left  = (temp[idx]     - xtc->attenuation * delayed_right) * volume;
+			float new_right = (temp[idx + 1] - xtc->attenuation * delayed_left)  * volume;
 
-			// Clipping prevention
-			/*if (new_left > 1.0f) new_left = 1.0f;
-			if (new_left < -1.0f) new_left = -1.0f;
-			if (new_right > 1.0f) new_right = 1.0f;
-			if (new_right < -1.0f) new_right = -1.0f;
-			data[idx] = new_left;
-			data[idx + 1] = new_right;*/
-			data[idx] = fmaxf(fminf(new_left, 1.0f), -1.0f) * volume;  // Apply volume
-			data[idx + 1] = fmaxf(fminf(new_right, 1.0f), -1.0f) * volume;
+			// Clamp after volume so we don't clip a pre-volume peak
+			data[idx]     = fmaxf(fminf(new_left,  1.0f), -1.0f);
+			data[idx + 1] = fmaxf(fminf(new_right, 1.0f), -1.0f);
 		}
 	} else { // SND_PCM_FORMAT_S16_LE
 		/*int16_t *data = (int16_t*)buffer;
@@ -251,7 +245,7 @@ void play_test_mode(int format, int flag)
 	const int frequency = 400;
 
 	AUDIO a;
-	if (AUDIO_init(&a, dev, sample_rate, channels, FRAMES, 1, format)) {
+	if (AUDIO_init_auto(&a, dev, sample_rate, channels, FRAMES, 1, format)) {
 		printf("Error: Failed to initialize ALSA for stereo output\n");
 		return;
 	}
@@ -376,19 +370,22 @@ void play_wav(char *name, int format, int flag)
 		printf("%dHz %dch\n", wav.sampleRate, wav.channels);
 
 		AUDIO a;
-		if (AUDIO_init(&a, dev, wav.sampleRate, wav.channels, FRAMES, 1, format)) {
+		if (AUDIO_init_auto(&a, dev, wav.sampleRate, wav.channels, FRAMES, 1, format)) {
 			return;
 		}
 
 		CrosstalkCancel xtc;
 		init_crosstalk_cancellation(&xtc, wav.sampleRate, wav.channels);
 
-		uint64_t (*func)(drwav* pWav, drflac_uint64 framesToRead, void* pBufferOut);
-		if (format) {
-			func = (uint64_t (*)(drwav *, drflac_uint64, void *))drwav_read_pcm_frames_f32;
+		uint64_t (*func)(drwav* pWav, drwav_uint64 framesToRead, void* pBufferOut);
+		if (a.actual_format == SND_PCM_FORMAT_FLOAT_LE) {
+			func = (uint64_t (*)(drwav *, drwav_uint64, void *))drwav_read_pcm_frames_f32;
 			printf(" with FLOAT 32bit\n");
+		} else if (a.actual_format == SND_PCM_FORMAT_S32_LE) {
+			func = (uint64_t (*)(drwav *, drwav_uint64, void *))drwav_read_pcm_frames_s32;
+			printf(" with S32 32bit\n");
 		} else {
-			func = (uint64_t (*)(drwav *, drflac_uint64, void *))drwav_read_pcm_frames_s16;
+			func = (uint64_t (*)(drwav *, drwav_uint64, void *))drwav_read_pcm_frames_s16;
 		}
 
 		int c = 0;
@@ -399,10 +396,9 @@ void play_wav(char *name, int format, int flag)
 				printf("!");
 			}
 			if (flag & USE_CROSSTALK) {
-				apply_crosstalk_cancellation(&xtc, a.buffer, a.frames, wav.channels, format);
+				apply_crosstalk_cancellation(&xtc, a.buffer, n, wav.channels, format);
 			}
-			AUDIO_play0(&a);
-			AUDIO_wait(&a, 100);
+			AUDIO_play(&a, a.buffer, n);
 			int k = key(&a);
 			if (k=='c') {
 				flag ^= USE_CROSSTALK;
@@ -430,7 +426,7 @@ void play_flac(char *name, int format, int flag)
 	printf("%dHz %dbit %dch\n", flac->sampleRate, flac->bitsPerSample, flac->channels);
 
 	AUDIO a;
-	if (AUDIO_init(&a, dev, flac->sampleRate, flac->channels, FRAMES, 1, format)) {
+	if (AUDIO_init_auto(&a, dev, flac->sampleRate, flac->channels, FRAMES, 1, format)) {
 		drflac_close(flac);
 		return;
 	}
@@ -438,10 +434,16 @@ void play_flac(char *name, int format, int flag)
 	CrosstalkCancel xtc;
 	init_crosstalk_cancellation(&xtc, flac->sampleRate, flac->channels);
 
+	// Pick decode function based on what ALSA actually agreed to, not what was requested.
+	// If we fell back from FLOAT_LE to S32_LE, decode as S32 directly.
+	// If format is S16 or the device accepted float, decode accordingly.
 	uint64_t (*func)(drflac* pFlac, drflac_uint64 framesToRead, void* pBufferOut);
-	if (format) {
+	if (a.actual_format == SND_PCM_FORMAT_FLOAT_LE) {
 		func = (uint64_t (*)(drflac *, drflac_uint64, void *))drflac_read_pcm_frames_f32;
 		printf(" with FLOAT 32bit\n");
+	} else if (a.actual_format == SND_PCM_FORMAT_S32_LE) {
+		func = (uint64_t (*)(drflac *, drflac_uint64, void *))drflac_read_pcm_frames_s32;
+		printf(" with S32 32bit\n");
 	} else {
 		func = (uint64_t (*)(drflac *, drflac_uint64, void *))drflac_read_pcm_frames_s16;
 	}
@@ -451,10 +453,9 @@ void play_flac(char *name, int format, int flag)
 	size_t n; // numberOfSamplesActuallyDecoded
 	while ((n = func(flac, a.frames, (void*)a.buffer)) > 0) {
 		if (flag & USE_CROSSTALK) {
-			apply_crosstalk_cancellation(&xtc, a.buffer, a.frames, flac->channels, format);
+			apply_crosstalk_cancellation(&xtc, a.buffer, n, flac->channels, format);
 		}
-		AUDIO_play0(&a);
-		AUDIO_wait(&a, 100);
+		AUDIO_play(&a, a.buffer, n);
 		int k = key(&a);
 		if (k=='c') {
 			flag ^= USE_CROSSTALK;
@@ -496,7 +497,7 @@ void play_dsf(char *name, int format, int flag)
 	}
 
 	AUDIO a;
-	if (AUDIO_init(&a, dev, decoder->sample_rate_pcm, decoder->channels, FRAMES, 1, format)) {
+	if (AUDIO_init_auto(&a, dev, decoder->sample_rate_pcm, decoder->channels, FRAMES, 1, format)) {
 		dsd_decoder_free(decoder);
 		fclose(f);
 		return;
@@ -517,8 +518,7 @@ void play_dsf(char *name, int format, int flag)
 			apply_crosstalk_cancellation(&xtc, a.buffer, n, decoder->channels, format);
 		}
 
-		AUDIO_play0(&a);
-		AUDIO_wait(&a, 100);
+		AUDIO_play(&a, a.buffer, n);
 
 		int k = key(&a);
 		if (k == 'c') {
@@ -550,7 +550,7 @@ int play_mp3(char *name, int format, int flag)
 
 	printf("%dHz %dch\n", mp3.sampleRate, mp3.channels);
 	AUDIO a;
-	if (AUDIO_init(&a, dev, mp3.sampleRate, mp3.channels, FRAMES, 1, format)) {
+	if (AUDIO_init_auto(&a, dev, mp3.sampleRate, mp3.channels, FRAMES, 1, format)) {
 		return 1;
 	}
 
@@ -571,10 +571,9 @@ int play_mp3(char *name, int format, int flag)
 	size_t n;
 	while ((n = func(&mp3, a.frames, (drmp3_int16*)a.buffer)) > 0) {
 		if (flag & USE_CROSSTALK) {
-			apply_crosstalk_cancellation(&xtc, a.buffer, a.frames, mp3.channels, format);
+			apply_crosstalk_cancellation(&xtc, a.buffer, n, mp3.channels, format);
 		}
-		AUDIO_play0(&a);
-		AUDIO_wait(&a, 100);
+		AUDIO_play(&a, a.buffer, n);
 		int k = key(&a);
 		if (k=='c') {
 			flag ^= USE_CROSSTALK;
@@ -612,7 +611,7 @@ int play_mp3(char *name, int format, int flag)
 
 	printf("%dHz %dch\n", info.sample_rate, info.channels);
 	AUDIO a;
-	if (AUDIO_init(&a, dev, info.sample_rate, info.channels, FRAMES, 1, 0)) {
+	if (AUDIO_init_auto(&a, dev, info.sample_rate, info.channels, FRAMES, 1, 0)) {
 		munmap(file_data, len);
 		return 1;
 	}
@@ -634,7 +633,7 @@ int play_mp3(char *name, int format, int flag)
 		stream_pos += frame_size;
 		bytes_left -= frame_size;
 		AUDIO_play(&a, (char*)sample_buf, info.audio_bytes/2/info.channels);
-		AUDIO_wait(&a, 100);
+
 
 		c += frame_size;
 		frame_size = mp3_decode(mp3, stream_pos, bytes_left, sample_buf, NULL);
@@ -653,7 +652,7 @@ int play_mp3(char *name, int format, int flag)
 
 void play_ogg(char *name, int flag)
 {
-	int n, num_c, error;
+	int n, error;
 	short outputs[FRAMES*2*100];
 
 	stb_vorbis *v = stb_vorbis_open_filename(name, &error, NULL);
@@ -664,7 +663,7 @@ void play_ogg(char *name, int flag)
 	printf("%dHz %dch\n", v->sample_rate, v->channels);
 
 	AUDIO a;
-	if (AUDIO_init(&a, dev, v->sample_rate, v->channels, FRAMES*2, 1, 0)) {
+	if (AUDIO_init_auto(&a, dev, v->sample_rate, v->channels, FRAMES*2, 1, 0)) {
 		stb_vorbis_close(v);
 		return;
 	}
@@ -680,7 +679,6 @@ void play_ogg(char *name, int flag)
 			apply_crosstalk_cancellation(&xtc, outputs, n, v->channels, 0);
 		}
 		AUDIO_play(&a, (char*)outputs, n);
-		AUDIO_wait(&a, 100);
 		int k = key(&a);
 		if (k=='c') {
 			flag ^= USE_CROSSTALK;
@@ -774,7 +772,7 @@ int play_wma(char *name, int flag)
 
 	printf("%dHz %dch\n", cc.sample_rate, cc.channels);
 	AUDIO a;
-	if (AUDIO_init(&a, dev, cc.sample_rate, cc.channels, FRAMES, 1, 0)) {
+	if (AUDIO_init_auto(&a, dev, cc.sample_rate, cc.channels, FRAMES, 1, 0)) {
 		fprintf(stderr, "Error: failed to initialize audio\n");
 		wma_decode_end(&cc);
 		munmap(file_data, len);
@@ -816,7 +814,6 @@ int play_wma(char *name, int flag)
 		}
 
 		AUDIO_play(&a, (char*)sample_buf, frames);
-		AUDIO_wait(&a, 100);
 
 		stream_pos += frame_size;
 		bytes_left -= frame_size;
@@ -883,7 +880,7 @@ int play_wma(char *name, int flag)
     printf("%dHz (output: %dHz) %dch\n", info.sampRateCore, output_samplerate, info.nChans);
 
     AUDIO a;
-    if (AUDIO_init(&a, dev, output_samplerate, info.nChans, FRAMES, 1, 0)) {
+    if (AUDIO_init_auto(&a, dev, output_samplerate, info.nChans, FRAMES, 1, 0)) {
         free(file_data);
         close(fd);
         AACFreeDecoder(aac);
@@ -901,7 +898,6 @@ int play_wma(char *name, int flag)
             AACGetLastFrameInfo(aac, &info);
             if (flag & USE_CROSSTALK) apply_crosstalk_cancellation(&xtc, sample_buf, AAC_MAX_NSAMPS, info.nChans, 0);
             AUDIO_play(&a, (char*)sample_buf, AAC_MAX_NSAMPS);
-            AUDIO_wait(&a, 100);
         } else {
             printf("\nAAC decode error %d, attempting resync\n", r);
             if (!sbr_enabled && info.sampRateCore <= 24000) {
@@ -986,7 +982,7 @@ int play_wma(char *name, int flag)
 	printf("%dHz (output: %dHz) %dch\n", info.sampRateCore, output_samplerate, info.nChans);
 
 	AUDIO a;
-	if (AUDIO_init(&a, dev, output_samplerate, info.nChans, FRAMES, 1, 0)) {
+	if (AUDIO_init_auto(&a, dev, output_samplerate, info.nChans, FRAMES, 1, 0)) {
 		printf("Error: failed to initialize ALSA with %dHz, %dch\n", output_samplerate, info.nChans);
 		free(file_data);
 		close(fd);
@@ -1015,7 +1011,6 @@ int play_wma(char *name, int flag)
 				apply_crosstalk_cancellation(&xtc, sample_buf, AAC_MAX_NSAMPS, info.nChans, 0);
 			}
 			AUDIO_play(&a, (char*)sample_buf, AAC_MAX_NSAMPS);
-			AUDIO_wait(&a, 100);
 		} else {
 			printf("\nAAC decode error %d, attempting resync (%d/%d)\n", r, resync_attempts + 1, max_resync_attempts);
 			if (!sbr_enabled && info.sampRateCore <= 24000) {
@@ -1030,7 +1025,7 @@ int play_wma(char *name, int flag)
 				resync_attempts = 0;
 				// Reinitialize ALSA with new sample rate
 				AUDIO_close(&a);
-				if (AUDIO_init(&a, dev, info.sampRateCore, info.nChans, FRAMES, 1, 0)) {
+				if (AUDIO_init_auto(&a, dev, info.sampRateCore, info.nChans, FRAMES, 1, 0)) {
 					printf("Error: failed to reinitialize ALSA with %dHz\n", info.sampRateCore);
 					free(file_data);
 					close(fd);
@@ -1081,8 +1076,6 @@ int play_aac(char *name, int flag)
     unsigned char *stream_pos;
     short sample_buf[AAC_BUF_SIZE * 2];
     int bytes_left;
-    int max_resync_attempts = 5;
-    int resync_attempts = 0;
 
     int fd = open(name, O_RDONLY);
     if (fd < 0) {
@@ -1121,7 +1114,7 @@ int play_aac(char *name, int flag)
     printf("%dHz (output: %dHz) %dch\n", info.sampRateCore, output_samplerate, info.nChans);
 
     AUDIO a;
-    if (AUDIO_init(&a, dev, output_samplerate, info.nChans, FRAMES, 1, 0)) {
+    if (AUDIO_init_auto(&a, dev, output_samplerate, info.nChans, FRAMES, 1, 0)) {
         printf("Error: failed to initialize ALSA with %dHz, %dch\n", output_samplerate, info.nChans);
         free(file_data);
         close(fd);
@@ -1141,7 +1134,6 @@ int play_aac(char *name, int flag)
             printf("\r%d/%d", (int)(stream_pos - file_data), bytes_left + (int)(stream_pos - file_data));
         }
         if (!r) {
-            resync_attempts = 0; // Reset on successful decode
             AACGetLastFrameInfo(aac, &info);
             int samples_per_frame = sbr_enabled ? 2048 : 1024; // Samples per channel
             if (verbose) {
@@ -1152,7 +1144,6 @@ int play_aac(char *name, int flag)
                 apply_crosstalk_cancellation(&xtc, sample_buf, frames, info.nChans, 0);
             }
             AUDIO_play(&a, (char*)sample_buf, frames);
-            AUDIO_wait(&a, 100);
         } else {
             printf("\nAAC decode error %d\n", r);
             // For raw AAC (MP4), do not attempt ADTS-based resync—just stop on error.
@@ -1177,18 +1168,44 @@ int play_aac(char *name, int flag)
     return 0;
 }
 
+// Play a single file by extension. Returns 1 if the file was recognised and
+// played, 0 if the extension is unsupported (so callers can skip/continue).
+int play_file(char *path, int format, int flag)
+{
+	char *e = findExt(path);
+	if (!strcasecmp(e, "flac")) {
+		play_flac(path, format, flag);
+	} else if (!strcasecmp(e, "mp3")) {
+		play_mp3(path, format, flag);
+	} else if (!strcasecmp(e, "mp4") || !strcasecmp(e, "m4a")) {
+		play_aac(path, flag);
+	} else if (!strcasecmp(e, "ogg")) {
+		play_ogg(path, flag);
+	} else if (!strcasecmp(e, "wav")) {
+		play_wav(path, format, flag);
+	} else if (!strcasecmp(e, "wma")) {
+		play_wma(path, flag);
+	} else if (!strcasecmp(e, "dsf")) {
+		play_dsf(path, format, flag);
+	} else {
+		return 0;
+	}
+	return 1;
+}
+
 void play_dir(char *name, char *type, char *regexp, int flag)
 {
-	char path[1024], ext[10];
+	char path[1024];
 	int num, back=0;
 	int format = flag & USE_FLOAT32 ? SND_PCM_FORMAT_FLOAT_LE : 0;
 
 	do {
 		LS_LIST *ls = ls_dir(name, flag, &num);
+		int played_count = 0;
 		for (int i=0; i<num; i++) {
 			char *e = findExt(ls[i].d_name);
 			if (type) {
-				if (!strstr(e, type)) {
+				if (strcasecmp(e, type)) {
 					continue;
 				}
 			}
@@ -1206,7 +1223,7 @@ void play_dir(char *name, char *type, char *regexp, int flag)
 				}
 			}
 
-			printf("\n\e[1m\e[35m%s\e[0m\n", ls[i].d_name);
+			printf("%s\e[1m\e[35m%s\e[0m\n", played_count > 0 ? "\n" : "", ls[i].d_name);
 			snprintf(path, 1024, "%s", ls[i].d_name);
 			if (access(ls[i].d_name, F_OK)<0) {
 				continue;
@@ -1222,25 +1239,10 @@ void play_dir(char *name, char *type, char *regexp, int flag)
 				continue;
 			}
 
-			if (strstr(e, "flac")) {
-				play_flac(path, format, flag);
-			} else if (strstr(e, "mp3")) {
-				play_mp3(path, format, flag);
-			} else if (strstr(e, "mp4")) {
-				play_aac(path, flag);
-			} else if (strstr(e, "m4a")) {
-				play_aac(path, flag);
-			} else if (strstr(e, "ogg")) {
-				play_ogg(path, flag);
-			} else if (strstr(e, "wav")) {
-				play_wav(path, format, flag);
-			} else if (strstr(e, "wma")) {
-				play_wma(path, flag);
-			} else if (strstr(e, "dsf")) {
-				play_dsf(path, format, flag);
-			} else {
+			if (!play_file(path, format, flag)) {
 				continue;
 			}
+			played_count++;
 
 			if (cmd=='\\' || cmd=='p' || cmd=='b') {
 				i = back;
@@ -1281,18 +1283,69 @@ void list_alsa_devices()
 {
 	snd_ctl_t *ctl;
 	snd_ctl_card_info_t *info;
+	snd_pcm_info_t *pcminfo;
 	snd_ctl_card_info_alloca(&info);
+	snd_pcm_info_alloca(&pcminfo);
+
+	fprintf(stderr, "Available playback devices:\n\n");
+	fprintf(stderr, "  %-14s %-28s %s\n", "Device", "Name", "Rates");
+	fprintf(stderr, "  %-14s %-28s %s\n", "------", "----", "-----");
+
 	int card = -1;
-	printf("Available ALSA devices:\n");
 	while (snd_card_next(&card) >= 0 && card >= 0) {
-		char name[32];
-		snprintf(name, sizeof(name), "hw:%d", card);
-		if (snd_ctl_open(&ctl, name, 0) >= 0) {
-			snd_ctl_card_info(ctl, info);
-			printf("Card %d: %s\n", card, snd_ctl_card_info_get_name(info));
-			snd_ctl_close(ctl);
+		char ctlname[32];
+		snprintf(ctlname, sizeof(ctlname), "hw:%d", card);
+		if (snd_ctl_open(&ctl, ctlname, 0) < 0) continue;
+		snd_ctl_card_info(ctl, info);
+
+		int dev = -1;
+		while (snd_ctl_pcm_next_device(ctl, &dev) >= 0 && dev >= 0) {
+			snd_pcm_info_set_device(pcminfo, dev);
+			snd_pcm_info_set_subdevice(pcminfo, 0);
+			snd_pcm_info_set_stream(pcminfo, SND_PCM_STREAM_PLAYBACK);
+			if (snd_ctl_pcm_info(ctl, pcminfo) < 0) continue;
+
+			// Build the hw: string
+			char hwdev[32];
+			snprintf(hwdev, sizeof(hwdev), "hw:%d,%d", card, dev);
+
+			// Get supported rates by opening the device directly
+			char rates[64] = "?";
+			snd_pcm_t *pcm;
+			if (snd_pcm_open(&pcm, hwdev, SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK) >= 0) {
+				snd_pcm_hw_params_t *params;
+				snd_pcm_hw_params_alloca(&params);
+				if (snd_pcm_hw_params_any(pcm, params) >= 0) {
+					// Test common rates and build a compact list
+					unsigned int common[] = { 44100, 48000, 88200, 96000, 176400, 192000, 0 };
+					char *p = rates;
+					char *end = rates + sizeof(rates) - 1;
+					for (int i = 0; common[i]; i++) {
+						if (snd_pcm_hw_params_test_rate(pcm, params, common[i], 0) == 0) {
+							int written = snprintf(p, end - p, "%s%u",
+							    p == rates ? "" : " ", common[i]/1000);
+							if (written > 0) p += written;
+						}
+					}
+					if (p != rates) {
+						// append "kHz"
+						snprintf(p, end - p, "kHz");
+					} else {
+						snprintf(rates, sizeof(rates), "unknown");
+					}
+				}
+				snd_pcm_close(pcm);
+			}
+
+			// Truncate long device names
+			char devname[29];
+			snprintf(devname, sizeof(devname), "%.28s", snd_pcm_info_get_name(pcminfo));
+
+			fprintf(stderr, "  %-14s %-28s %s\n", hwdev, devname, rates);
 		}
+		snd_ctl_close(ctl);
 	}
+	fprintf(stderr, "\n");
 }
 
 void usage(FILE* fp, int argc, char** argv)
@@ -1301,7 +1354,8 @@ void usage(FILE* fp, int argc, char** argv)
 	        "Usage: %s [options] dir\n\n"
 	        "Options:\n"
 	        "-h                 Print this help message\n"
-	        "-d <device name>   Specify ALSA device [e.g., default hw:0,0 plughw:0,0...]\n"
+	        "-L                 List available playback devices and supported rates\n"
+	        "-d <device name>   Specify ALSA device [e.g., hw:1,0 plughw:1,0...]\n"
 	        "-f                 Use 32-bit floating-point playback\n"
 	        "-r                 Recursively search directories\n"
 	        "-x                 Enable random playback\n"
@@ -1329,11 +1383,14 @@ int main(int argc, char *argv[])
 	int clock = 0;
 
 	parg_init(&ps);
-	while ((c = parg_getopt(&ps, argc, argv, "hd:frxs:t:pclvDTV")) != -1) {
+	while ((c = parg_getopt(&ps, argc, argv, "hd:frxs:t:pclvDTVL")) != -1) {
 		switch (c) {
 		case 1:
 			dir = (char*)ps.optarg;
 			break;
+		case 'L':
+			list_alsa_devices();
+			return 0;
 		case 'd':
 			dev = (char*)ps.optarg;
 			break;
@@ -1354,9 +1411,14 @@ int main(int argc, char *argv[])
 			type = (char*)ps.optarg;
 			break;
 		case 'p': {
+			if (geteuid() != 0) {
+				fprintf(stderr, "warning: -p optimizations require root (or CAP_SYS_NICE); some settings may be skipped\n");
+			}
 			FILE *fp = fopen("/sys/devices/system/clocksource/clocksource0/current_clocksource", "w");
-			fprintf(fp, "tsc");
-			fclose(fp);
+			if (fp) {
+				fprintf(fp, "tsc");
+				fclose(fp);
+			}
 			set_realtime_priority();
 			set_cpu("performance");
 			clock = 1;
@@ -1396,7 +1458,45 @@ int main(int argc, char *argv[])
 		int format = flag & USE_FLOAT32 ? SND_PCM_FORMAT_FLOAT_LE : 0;
 		play_test_mode(format, flag);
 	} else {
-		play_dir(dir, type, regexp, flag);
+		// Before starting playback, check once whether the device will silently
+		// resample. Use 96000Hz as the probe rate since that's the most common
+		// hi-res rate and the one most likely to be resampled by PipeWire.
+		int is_hw = (strncmp(dev, "hw:", 3) == 0 || strncmp(dev, "plughw:", 7) == 0);
+		if (!is_hw && device_will_silently_resample(dev, 96000)) {
+			fprintf(stderr,
+			        "\nerror: '%s' will silently resample audio to its internal clock rate.\n"
+			        "       This produces corrupted (static) output. Options:\n"
+			        "\n"
+			        "  1. Use a direct hardware device for bit-perfect playback:\n",
+			        dev);
+			list_alsa_devices();
+			fprintf(stderr,
+			        "     Example: aplay+ -d hw:1,0 ...\n"
+			        "\n"
+			        "  2. Configure PipeWire to clock-switch instead of resampling:\n"
+			        "       mkdir -p ~/.config/pipewire/pipewire.conf.d\n"
+			        "       cat > ~/.config/pipewire/pipewire.conf.d/99-rates.conf << 'EOF'\n"
+			        "context.properties = {\n"
+			        "    default.clock.rate = 48000\n"
+			        "    default.clock.allowed-rates = [ 44100 48000 88200 96000 ]\n"
+			        "}\n"
+			        "EOF\n"
+			        "       systemctl --user restart pipewire pipewire-pulse\n"
+			        "\n");
+			return 1;
+		}
+		struct stat st;
+		if (stat(dir, &st) == 0 && S_ISREG(st.st_mode)) {
+			// Single file passed — play it directly
+			int format = flag & USE_FLOAT32 ? SND_PCM_FORMAT_FLOAT_LE : 0;
+			printf("\e[1m\e[35m%s\e[0m\n", dir);
+			if (!play_file(dir, format, flag)) {
+				fprintf(stderr, "error: unsupported file format: %s\n", dir);
+				return 1;
+			}
+		} else {
+			play_dir(dir, type, regexp, flag);
+		}
 	}
 
 	if (clock) {
