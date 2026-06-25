@@ -16,7 +16,7 @@ dependencies, no daemon, no GUI.
 | Ogg Vorbis | `.ogg` | Via stb_vorbis |
 | AAC | `.m4a`, `.mp4` | Raw AAC and MP4 container |
 | WMA | `.wma` | Windows Media Audio |
-| DSD/DSF | `.dsf` | DSD audio in DSF container |
+| DSD/DSF | `.dsf` | Native DSD passthrough if supported, else DSD→PCM |
 
 ---
 
@@ -102,6 +102,42 @@ resampling occurs.
 
 ---
 
+## DSD Playback
+
+aplay+ plays `.dsf` (DSD) files two ways, chosen automatically:
+
+**Native DSD passthrough** is used when the device supports the
+`DSD_U32_BE` format (most native-DSD USB DACs do). The 1-bit DSD stream is sent
+straight to the DAC with no filtering, decimation, or conversion — true
+bit-perfect DSD. You'll see a line like:
+
+```
+5644800Hz DSD 2ch (native DSD_U32_BE @ 176400Hz)
+```
+
+and the DAC's DSD indicator should light up. Native passthrough is only
+attempted on `hw:`/`plughw:` devices, since PipeWire/PulseAudio do not expose
+native DSD formats.
+
+**DSD→PCM conversion** is the fallback when the DAC can't do native DSD. The
+DSD stream is decoded to PCM with an 8-stage low-pass filter to suppress DSD's
+ultrasonic noise. DSD64 converts to 88.2kHz, DSD128 to 176.4kHz, DSD256 to
+352.8kHz. You'll see:
+
+```
+176400Hz 2ch (DSD->PCM)
+ with S32 32bit
+```
+
+Use `-P` to force PCM conversion even when native DSD is available — useful for
+A/B comparison or if a DAC misbehaves with native DSD.
+
+The native DSD rate sent to ALSA is the DSD bit rate divided by 32 (since
+`DSD_U32_BE` packs 32 1-bit samples per 4-byte frame): DSD64 → 88200,
+DSD128 → 176400, DSD256 → 352800.
+
+---
+
 ## All Options
 
 ```
@@ -119,6 +155,7 @@ Options:
   -t <ext>            Only play files of this type (e.g. flac, mp3, wav)
   -v                  Verbose output (decoder frame info, etc.)
   -V <volume>         Software volume, 0.0–1.0 (default: 1.0)
+  -P                  Force DSD→PCM conversion (default: native DSD if supported)
   -c                  Enable crosstalk cancellation (XTC)
   -D <metres>         Speaker distance for XTC delay calculation (default: 0.5)
   -p                  Linux platform optimisations (requires root)
@@ -143,10 +180,13 @@ Use `aplay+ -L` to find the right `hw:X,Y` string for your system.
 
 ### `-f` — 32-bit Float Output
 
-Requests `FLOAT_LE` (32-bit float) output format from ALSA instead of the
-default `S16_LE`. Useful if your DAC or interface handles float natively.
-If the device does not support float, aplay+ automatically falls back to
-`S32_LE` via `plughw`.
+Requests `FLOAT_LE` (32-bit float) output format from ALSA. If the device does
+not support float, aplay+ automatically falls back to `S32_LE` via `plughw`.
+
+Note that `-f` is usually unnecessary: aplay+ already picks a sensible format
+per source. 16-bit files play as `S16_LE`, and 24/32-bit files automatically use
+`S32_LE` — which is required for many USB DACs that only expose 24-bit endpoints
+at high sample rates (sending S16_LE to those produces silence).
 
 ### `-r` — Recursive
 
@@ -203,6 +243,16 @@ hardware mixer.
 
 ```bash
 ./aplay+ -V 0.7 /path/to/music/
+```
+
+### `-P` — Force DSD→PCM Conversion
+
+By default, `.dsf` files play via native DSD passthrough when the DAC supports
+it (see [DSD Playback](#dsd-playback)). `-P` forces the DSD→PCM conversion path
+instead, even on a native-DSD-capable DAC.
+
+```bash
+./aplay+ -P -d hw:3,0 /Music/album.dsf
 ```
 
 ### `-c` — Crosstalk Cancellation
@@ -285,6 +335,12 @@ These keys work during playback:
 
 # Loop an album at reduced volume
 ./aplay+ -l -V 0.8 -d hw:1,0 "/Music/Artist/Album/"
+
+# Play DSD natively (DAC's DSD light should come on)
+./aplay+ -d hw:3,0 "/Music/Album (DSD128)/01. Track.dsf"
+
+# Force DSD->PCM conversion instead of native
+./aplay+ -P -d hw:3,0 "/Music/Album (DSD128)/01. Track.dsf"
 ```
 
 ---

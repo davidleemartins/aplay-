@@ -38,6 +38,7 @@
 int verbose = 0;
 float volume = 1.0f;
 int loop_mode = 0;
+int force_pcm_dsd = 0; // -P forces DSD->PCM conversion instead of native passthrough
 float speaker_distance_m = 0.5;
 int cmd;
 int key(AUDIO *a)
@@ -367,7 +368,11 @@ void play_wav(char *name, int format, int flag)
 {
 	drwav wav;
 	if (drwav_init_file(&wav, name, NULL)) {
-		printf("%dHz %dch\n", wav.sampleRate, wav.channels);
+		printf("%dHz %dbit %dch\n", wav.sampleRate, wav.bitsPerSample, wav.channels);
+
+		if (!format && wav.bitsPerSample > 16) {
+			format = SND_PCM_FORMAT_S32_LE;
+		}
 
 		AUDIO a;
 		if (AUDIO_init_auto(&a, dev, wav.sampleRate, wav.channels, FRAMES, 1, format)) {
@@ -424,6 +429,14 @@ void play_flac(char *name, int format, int flag)
 		return;
 	}
 	printf("%dHz %dbit %dch\n", flac->sampleRate, flac->bitsPerSample, flac->channels);
+
+	// If the user didn't request a specific format (-f), pick the best match
+	// for the source bit depth. S16_LE for 16-bit, S32_LE for 20/24/32-bit.
+	// This matters for DACs whose USB endpoints only expose 24-bit at high
+	// sample rates — sending S16_LE to a 24-bit endpoint produces silence.
+	if (!format && flac->bitsPerSample > 16) {
+		format = SND_PCM_FORMAT_S32_LE;
+	}
 
 	AUDIO a;
 	if (AUDIO_init_auto(&a, dev, flac->sampleRate, flac->channels, FRAMES, 1, format)) {
@@ -489,9 +502,62 @@ void play_dsf(char *name, int format, int flag)
 		return;
 	}
 
-	printf("%dHz %dch\n", decoder->sample_rate_pcm, decoder->channels);
+	// --- Try native DSD passthrough first (bit-perfect, no PCM conversion) ---
+	// Only attempt on hw:/plughw: devices and when the user hasn't forced PCM.
+	int is_hw = (strncmp(dev, "hw:", 3) == 0 || strncmp(dev, "plughw:", 7) == 0);
+	unsigned int native_rate = dsd_native_rate(decoder);
+	if (is_hw && !force_pcm_dsd &&
+	    AUDIO_supports_dsd(dev, SND_PCM_FORMAT_DSD_U32_BE, native_rate, decoder->channels)) {
+
+		printf("%dHz DSD %dch (native DSD_U32_BE @ %uHz)\n",
+		       decoder->sample_rate_dsd, decoder->channels, native_rate);
+
+		AUDIO a;
+		// Scale the period to at least ~5ms like AUDIO_init_auto does. A 32-frame
+		// period at native DSD rates (176400Hz) is only 181µs — barely above the
+		// USB 125µs packet interval — causing continuous underruns and silence.
+		int native_frames = FRAMES;
+		unsigned int min_frames = native_rate / 200; // 5ms worth
+		while ((unsigned int)native_frames < min_frames) native_frames *= 2;
+
+		if (AUDIO_init(&a, dev, native_rate, decoder->channels, native_frames,
+		               1, SND_PCM_FORMAT_DSD_U32_BE)) {
+			dsd_decoder_free(decoder);
+			fclose(f);
+			return;
+		}
+
+		uint64_t total_native = dsd_native_total_frames(decoder);
+		uint64_t frames_played = 0;
+		dsd_native_reset(decoder); // ensure clean start at data chunk
+		printf("\e[?25l");
+		size_t n;
+		while ((n = dsd_read_native_u32be(decoder, a.frames, a.buffer)) > 0) {
+			AUDIO_play(&a, a.buffer, n);
+			int k = key(&a);
+			if (k) break; // no crosstalk in native mode — it's a raw bitstream
+			frames_played += n;
+			printf("\r%lu/%lu", frames_played, total_native);
+			fflush(stdout);
+		}
+		printf("\n\e[?25h");
+
+		AUDIO_close(&a);
+		dsd_decoder_free(decoder);
+		fclose(f);
+		return;
+	}
+
+	// --- Fallback: convert DSD to PCM ---
+	printf("%dHz %dch (DSD->PCM)\n", decoder->sample_rate_pcm, decoder->channels);
+
+	// DSF is always high-resolution — default to S32_LE unless user requested float.
+	if (!format) format = SND_PCM_FORMAT_S32_LE;
+
 	if (format == SND_PCM_FORMAT_FLOAT_LE) {
 		printf(" with FLOAT 32bit\n");
+	} else if (format == SND_PCM_FORMAT_S32_LE) {
+		printf(" with S32 32bit\n");
 	} else {
 		printf(" with S16_LE 16bit\n");
 	}
@@ -1365,6 +1431,7 @@ void usage(FILE* fp, int argc, char** argv)
 	        "-l                 Loop the directory playlist\n"
 	        "-v                 Verbose mode\n"
 	        "-V <volume>        Set software volume (0.0-1.0, default 1.0)\n"
+	        "-P                 Force DSD->PCM conversion (default: native DSD if supported)\n"
 	        "-c                 Enable crosstalk cancellation\n"
 	        "-D                 Speaker distance for crosstalk cancellation\n"
 	        "-T                 Enable test mode (sine wave: left, right, pan)\n"
@@ -1383,11 +1450,25 @@ int main(int argc, char *argv[])
 	int clock = 0;
 
 	parg_init(&ps);
-	while ((c = parg_getopt(&ps, argc, argv, "hd:frxs:t:pclvDTVL")) != -1) {
+	while ((c = parg_getopt(&ps, argc, argv, "hd:frxs:t:pclvDTVLP")) != -1) {
 		switch (c) {
-		case 1:
-			dir = (char*)ps.optarg;
+		case 1: {
+			// Expand leading ~ to $HOME
+			const char *arg = ps.optarg;
+			if (arg[0] == '~' && (arg[1] == '/' || arg[1] == '\0')) {
+				const char *home = getenv("HOME");
+				if (home) {
+					static char expanded[4096];
+					snprintf(expanded, sizeof(expanded), "%s%s", home, arg + 1);
+					dir = expanded;
+				} else {
+					dir = (char*)arg;
+				}
+			} else {
+				dir = (char*)arg;
+			}
 			break;
+		}
 		case 'L':
 			list_alsa_devices();
 			return 0;
@@ -1446,6 +1527,9 @@ int main(int argc, char *argv[])
 			break;
 		case 'D':
 			speaker_distance_m = atof(ps.optarg);
+			break;
+		case 'P':
+			force_pcm_dsd = 1;
 			break;
 		case 'h':
 			usage(stderr, argc, argv);

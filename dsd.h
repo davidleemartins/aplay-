@@ -70,19 +70,28 @@ int main() {
 #ifndef SND_PCM_FORMAT_FLOAT_LE
 #define SND_PCM_FORMAT_FLOAT_LE 14
 #endif
+#ifndef SND_PCM_FORMAT_S32_LE
+#define SND_PCM_FORMAT_S32_LE 10
+#endif
+// Native DSD formats (Linux kernel snd_pcm_format_t values)
+#ifndef SND_PCM_FORMAT_DSD_U32_BE
+#define SND_PCM_FORMAT_DSD_U32_BE 52 // 32 1-bit samples packed in 4 bytes, big-endian
+#endif
 
 #define DSD_SAMPLES_PER_BYTE 8
 #define MAX_CHANNELS 2
 
+#define DSD_FILTER_STAGES 8
+
 // 2次フィルタの状態と係数を定義
 typedef struct {
-    double x1, x2; // 入力の過去値
-    double y1, y2; // 出力の過去値
+    double x1, x2;
+    double y1, y2;
 } FilterState2;
 
 typedef struct {
-    double a0, a1, a2; // フィードフォワード係数
-    double b1, b2;     // フィードバック係数
+    double a0, a1, a2;
+    double b1, b2;
 } FilterCoeff2;
 
 typedef struct {
@@ -98,19 +107,17 @@ typedef struct {
 
     uint8_t* block_buffer;
     size_t block_buffer_size;
-    
-    // Indexing and filter state
+
     size_t current_dsd_bit_index;
 
-    // 4段階の2次フィルタ
-    FilterState2 filter_state[MAX_CHANNELS][4];
-    FilterCoeff2 filter_coeff;
+    // Independent coefficients per stage — each tuned to a different cutoff
+    // for a steeper overall rolloff than sharing one coefficient set.
+    FilterState2 filter_state[MAX_CHANNELS][DSD_FILTER_STAGES];
+    FilterCoeff2 filter_coeff[DSD_FILTER_STAGES];
 
-    // --- RMS 推定のための追加フィールド ---
-    int initial_rms_estimation_done; // RMS推定が完了したかどうかのフラグ
-    double current_scale_factor;     // 適用するスケーリング係数
-    long current_file_pos;           // RMS推定後のファイルポインタを保存
-    // ------------------------------------
+    int initial_rms_estimation_done;
+    double current_scale_factor;
+    long current_file_pos;
 
 } DSDDecoder;
 
@@ -127,15 +134,36 @@ static int dsd_load_next_block(DSDDecoder* decoder) {
     return bytes_read > 0;
 }
 
-// フィルタ係数の初期化（簡易バターワースフィルタ）
-static void init_filter_coeff(FilterCoeff2* coeff, double cutoff_freq, double sample_rate_dsd) {
-    double omega = tan(M_PI * cutoff_freq / sample_rate_dsd);
+// Initialize one biquad lowpass stage (bilinear-transform Butterworth).
+static void init_one_biquad(FilterCoeff2* coeff, double cutoff_hz, double sample_rate)
+{
+    double omega = tan(M_PI * cutoff_hz / sample_rate);
     double denom = 1.0 + sqrt(2.0) * omega + omega * omega;
     coeff->a0 = omega * omega / denom;
     coeff->a1 = 2.0 * coeff->a0;
     coeff->a2 = coeff->a0;
     coeff->b1 = 2.0 * (omega * omega - 1.0) / denom;
     coeff->b2 = (1.0 - sqrt(2.0) * omega + omega * omega) / denom;
+}
+
+// Initialize DSD_FILTER_STAGES biquad lowpass stages with geometrically-spaced
+// cutoff frequencies. Starting well below Nyquist and stepping up gives a much
+// steeper combined rolloff than using the same cutoff for all stages, without
+// needing a proper FIR design. The lowest stage handles audio-band shaping;
+// higher stages suppress progressively higher DSD noise frequencies.
+static void init_filter_stages(FilterCoeff2* coeffs, int stages,
+                                double audio_cutoff_hz, double sample_rate_dsd,
+                                double decimation_factor)
+{
+    // Space cutoffs geometrically from audio_cutoff to ~1/4 of DSD rate.
+    // This gives steep rolloff starting at 20kHz all the way up to ~700kHz,
+    // suppressing the bulk of DSD noise-shaping energy before decimation.
+    double top = sample_rate_dsd / (decimation_factor * 2.0); // Nyquist of output
+    double ratio = pow(top / audio_cutoff_hz, 1.0 / (stages - 1));
+    for (int i = 0; i < stages; ++i) {
+        double cutoff = audio_cutoff_hz * pow(ratio, i);
+        init_one_biquad(&coeffs[i], cutoff, sample_rate_dsd);
+    }
 }
 
 // 2次フィルタの適用
@@ -170,15 +198,14 @@ DSDDecoder* dsd_decoder_init_file(FILE* file) {
 
     if (read_le32(header_buf + 32) != 1 || (decoder->channels < 1 || decoder->channels > MAX_CHANNELS) || decoder->block_size_bytes == 0) { free(decoder); return NULL; }
     
-    // PCMサンプルレートの計算 (デシメーションファクターの調整を検討)
-    /*if (decoder->sample_rate_dsd == 2822400) decoder->sample_rate_pcm = 88200; // DSD64 -> PCM 88.2kHz (factor 32)
-    else if (decoder->sample_rate_dsd == 5644800) decoder->sample_rate_pcm = 176400; // DSD128 -> PCM 176.4kHz (factor 32)
-    else if (decoder->sample_rate_dsd == 11289600) decoder->sample_rate_pcm = 352800; // DSD256 -> PCM 352.8kHz (factor 32)
-    else decoder->sample_rate_pcm = decoder->sample_rate_dsd / 32; // Fallback, adjust if needed*/
-    if (decoder->sample_rate_dsd == 2822400) decoder->sample_rate_pcm = 176400;
-    else if (decoder->sample_rate_dsd == 5644800) decoder->sample_rate_pcm = 176400;
-    else if (decoder->sample_rate_dsd == 11289600) decoder->sample_rate_pcm = 176400;
-    else decoder->sample_rate_pcm = decoder->sample_rate_dsd / 32; // Fallback, adjust if needed
+    // PCM output rate: decimate by 32 from DSD rate.
+    // DSD64  (2.8224MHz)  -> 88200Hz  (decimation factor 32)
+    // DSD128 (5.6448MHz)  -> 176400Hz (decimation factor 32)
+    // DSD256 (11.2896MHz) -> 352800Hz (decimation factor 32)
+    if (decoder->sample_rate_dsd == 2822400)       decoder->sample_rate_pcm = 88200;
+    else if (decoder->sample_rate_dsd == 5644800)  decoder->sample_rate_pcm = 176400;
+    else if (decoder->sample_rate_dsd == 11289600) decoder->sample_rate_pcm = 352800;
+    else decoder->sample_rate_pcm = decoder->sample_rate_dsd / 32;
 
     size_t decimation_factor = decoder->sample_rate_dsd / decoder->sample_rate_pcm;
     decoder->totalPCMFrameCount = total_dsd_samples / decimation_factor;
@@ -192,10 +219,10 @@ DSDDecoder* dsd_decoder_init_file(FILE* file) {
     if (fread(chunk_id, 1, 12, file) != 12 || strncmp(chunk_id, "data", 4) != 0) { free(decoder->block_buffer); free(decoder); return NULL; }
     fseek(file, ftell(file) - 12 + 12, SEEK_SET); // dataチャンクの先頭へ
 
-    // --- Initialize filter ---
-    double cutoff_freq = decoder->sample_rate_pcm / 2.0; // PCMサンプリングレートの半分
-    init_filter_coeff(&decoder->filter_coeff, cutoff_freq, decoder->sample_rate_dsd);
-    // フィルタ状態の初期化
+    // Cutoff at 20kHz for stage 0; higher stages cover up to Nyquist of the
+    // PCM output rate, suppressing DSD noise-shaping energy across the spectrum.
+    init_filter_stages(decoder->filter_coeff, DSD_FILTER_STAGES,
+                       20000.0, decoder->sample_rate_dsd, decimation_factor);
     memset(decoder->filter_state, 0, sizeof(decoder->filter_state));
     
     // 初期ブロックをロード
@@ -261,13 +288,14 @@ static void dsd_decoder_estimate_rms(DSDDecoder* decoder, int format) {
                     current_bit = k;
                 }
                 size_t byte_idx = current_bit / DSD_SAMPLES_PER_BYTE;
-                //int bit_pos = 7 - (current_bit % DSD_SAMPLES_PER_BYTE);
+                // DSF stores 1-bit data LSB-first (Sony DSF spec).
                 int bit_pos = current_bit % DSD_SAMPLES_PER_BYTE;
                 double dsd_val = ((dsd_channel_data[byte_idx] >> bit_pos) & 1) ? 1.0 : -1.0;
 
                 double temp = dsd_val;
-                for (int stage = 0; stage < 4; ++stage) {
-                    temp = apply_filter2(&decoder->filter_state[ch][stage], &decoder->filter_coeff, temp);
+                for (int stage = 0; stage < DSD_FILTER_STAGES; ++stage) {
+                    temp = apply_filter2(&decoder->filter_state[ch][stage],
+                                        &decoder->filter_coeff[stage], temp);
                 }
                 accum += temp;
             }
@@ -295,19 +323,15 @@ end_estimation_loop:
       }
       double estimated_rms = sqrt(average_rms_sq);
 
-      // 目標とするRMS値 (例: PCMフルスケールの-12dBFSに相当)
-      // 0dBFS = 1.0, -6dBFS = 0.5, -12dBFS = 0.25
-      const double TARGET_RMS = 0.25; // 経験的に良いとされる値
+      // Target -3dBFS RMS — leaves headroom without over-attenuating.
+      const double TARGET_RMS = 0.7;
 
       if (estimated_rms > 1e-9) {
           decoder->current_scale_factor = TARGET_RMS / estimated_rms;
-
-        if (decoder->current_scale_factor < 2.0) {
-            decoder->current_scale_factor = 2.0;
-        }
-        if (decoder->current_scale_factor > 4.0) {
-            decoder->current_scale_factor = 4.0;
-        }
+          // Only clamp the ceiling to prevent clipping; don't force a minimum boost.
+          if (decoder->current_scale_factor > 8.0) {
+              decoder->current_scale_factor = 8.0;
+          }
       } else {
           decoder->current_scale_factor = 1.0;
       }
@@ -328,7 +352,6 @@ end_estimation_loop:
 size_t dsd_decoder_read_pcm_frames(DSDDecoder* decoder, size_t frames_to_read, void* buffer, int format) {
     if (!decoder || !buffer || frames_to_read == 0 || decoder->pcm_frames_processed >= decoder->totalPCMFrameCount) return 0;
 
-    // RMS推定がまだ行われていなければ実行
     if (!decoder->initial_rms_estimation_done) {
         dsd_decoder_estimate_rms(decoder, format);
     }
@@ -337,18 +360,23 @@ size_t dsd_decoder_read_pcm_frames(DSDDecoder* decoder, size_t frames_to_read, v
     if (decimation_factor == 0) return 0;
 
     size_t frames_read = 0;
-    int16_t* buffer_s16 = (int16_t*)buffer;
-    float* buffer_f32 = (float*)buffer;
+    int16_t*  buffer_s16 = (int16_t*)buffer;
+    int32_t*  buffer_s32 = (int32_t*)buffer;
+    float*    buffer_f32 = (float*)buffer;
     size_t block_size_bits = decoder->block_size_bytes * DSD_SAMPLES_PER_BYTE;
 
-    double scale = decoder->current_scale_factor / decimation_factor;
-    double filtered[MAX_CHANNELS]; // 各チャンネルのフィルタ出力
     for (size_t i = 0; i < frames_to_read; ++i) {
+        // Process each channel independently
         for (int ch = 0; ch < decoder->channels; ++ch) {
             const uint8_t* dsd_channel_data = decoder->block_buffer + (ch * decoder->block_size_bytes);
             size_t start_bit = decoder->current_dsd_bit_index;
 
-            int sum = 0;
+            // CORRECT ORDER: run each DSD bit through the lowpass filter at the
+            // DSD sample rate, then take the filter output after decimation_factor
+            // bits as the PCM sample. This is proper anti-aliasing decimation.
+            // Running the filter after bit-averaging (the previous approach) does
+            // not prevent aliasing and causes the muffled sound.
+            double pcm_val = 0.0;
             for (size_t k = 0; k < decimation_factor; ++k) {
                 size_t current_bit = start_bit + k;
                 if (current_bit >= block_size_bits) {
@@ -358,39 +386,49 @@ size_t dsd_decoder_read_pcm_frames(DSDDecoder* decoder, size_t frames_to_read, v
                     current_bit = k;
                 }
                 size_t byte_idx = current_bit / DSD_SAMPLES_PER_BYTE;
-                int bit_pos = 7 - (current_bit % DSD_SAMPLES_PER_BYTE);
+                // DSF stores 1-bit data LSB-first (Sony DSF spec).
+                int bit_pos = current_bit % DSD_SAMPLES_PER_BYTE;
+                double dsd_bit = ((dsd_channel_data[byte_idx] >> bit_pos) & 1) ? 1.0 : -1.0;
 
-                sum += ((dsd_channel_data[byte_idx] >> bit_pos) & 1) ? 1 : 0;
+                // Filter each bit at DSD rate through all stages
+                double filtered = dsd_bit;
+                for (int stage = 0; stage < DSD_FILTER_STAGES; ++stage) {
+                    filtered = apply_filter2(&decoder->filter_state[ch][stage],
+                                            &decoder->filter_coeff[stage], filtered);
+                }
+                // Accumulate — the last filter output is our decimated sample
+                pcm_val = filtered;
             }
 
-            //filtered[ch] = ((double)sum / decimation_factor)*2.0-1.0;
-            //filtered[ch] = ((double)sum / decimation_factor)*decoder->current_scale_factor-decoder->current_scale_factor/2;
-            filtered[ch] = ((double)sum / decimation_factor * 2.0 - 1.0) * decoder->current_scale_factor;
-        }
+            // Apply scale after filtering
+            pcm_val *= decoder->current_scale_factor;
 
-        // PCMバッファに書き込み
-        for (int ch = 0; ch < decoder->channels; ++ch) {
-                double pcm_val = filtered[ch];
-                for (int stage = 0; stage < 4; ++stage) {
-                    pcm_val = apply_filter2(&decoder->filter_state[ch][stage], &decoder->filter_coeff, pcm_val);
-                }
-            //double pcm_val = filtered[ch];
+            // Write to output buffer in the correct format
             if (format == SND_PCM_FORMAT_FLOAT_LE) {
-                if (pcm_val > 1.0) pcm_val = 1.0;
+                if (pcm_val >  1.0) pcm_val =  1.0;
                 if (pcm_val < -1.0) pcm_val = -1.0;
                 buffer_f32[i * decoder->channels + ch] = (float)pcm_val;
+            } else if (format == SND_PCM_FORMAT_S32_LE) {
+                // Scale to 32-bit range; DAC uses top 24 bits
+                double s = pcm_val * 2147483647.0;
+                if (s >  2147483647.0) s =  2147483647.0;
+                if (s < -2147483648.0) s = -2147483648.0;
+                buffer_s32[i * decoder->channels + ch] = (int32_t)s;
             } else {
-                int32_t s16_val = (int32_t)(pcm_val * 32767.0);
-                if (s16_val > 32767) s16_val = 32767;
-                if (s16_val < -32768) s16_val = -32768;
-                buffer_s16[i * decoder->channels + ch] = (int16_t)s16_val;
+                // S16_LE fallback
+                double s = pcm_val * 32767.0;
+                if (s >  32767.0) s =  32767.0;
+                if (s < -32768.0) s = -32768.0;
+                buffer_s16[i * decoder->channels + ch] = (int16_t)s;
             }
         }
 
+        // Advance DSD bit index by one decimation block (same for all channels)
         decoder->current_dsd_bit_index += decimation_factor;
         if (decoder->current_dsd_bit_index >= block_size_bits) {
             if (!dsd_load_next_block(decoder)) {
                 frames_read++;
+                decoder->pcm_frames_processed++;
                 goto end_loop;
             }
         }
@@ -402,6 +440,89 @@ size_t dsd_decoder_read_pcm_frames(DSDDecoder* decoder, size_t frames_to_read, v
 
 end_loop:
     return frames_read;
+}
+
+// Native DSD rate for ALSA: the DSD bit rate divided by 32, because DSD_U32_BE
+// packs 32 1-bit samples into each 4-byte frame. DSD64 (2.8224MHz) -> 88200,
+// DSD128 (5.6448MHz) -> 176400, DSD256 -> 352800.
+static int dsd_native_rate(DSDDecoder* decoder) {
+    return decoder->sample_rate_dsd / 32;
+}
+
+// Total native DSD frames: each frame carries 32 DSD bits per channel.
+static uint64_t dsd_native_total_frames(DSDDecoder* decoder) {
+    // totalPCMFrameCount was DSD_samples / decimation_factor; recover DSD sample
+    // count and divide by 32 bits-per-native-frame.
+    size_t decimation_factor = decoder->sample_rate_dsd / decoder->sample_rate_pcm;
+    uint64_t total_dsd_samples = decoder->totalPCMFrameCount * decimation_factor;
+    return total_dsd_samples / 32;
+}
+
+// Bit-reverse a byte (LSB-first DSF -> MSB-first for DSD_U32_BE).
+static inline uint8_t dsd_bitrev8(uint8_t v) {
+    return (uint8_t)((v * 0x0202020202ULL & 0x010884422010ULL) % 1023);
+}
+
+// Reset decoder to the start of audio data for native playback. The first block
+// is already loaded by init, but if RMS estimation or PCM playback ran first,
+// this rewinds cleanly. Call before the first dsd_read_native_u32be.
+static void dsd_native_reset(DSDDecoder* decoder) {
+    // current_file_pos was saved AFTER the first block load in init, so to get
+    // back to the true start of data we must seek to (current_file_pos - one block).
+    long data_start = decoder->current_file_pos - (long)decoder->block_buffer_size;
+    if (data_start < 0) data_start = decoder->current_file_pos;
+    fseek(decoder->file, data_start, SEEK_SET);
+    decoder->current_dsd_bit_index = 0;
+    decoder->pcm_frames_processed = 0;
+    dsd_load_next_block(decoder);
+}
+
+// Read native DSD frames packed as DSD_U32_BE. Each output frame is, per channel,
+// 4 bytes holding 32 consecutive DSD bits. No filtering, no decimation, no scaling
+// — the raw 1-bit stream goes straight to the DAC. Returns frames written.
+//
+// The DAC expects "oldest bits in MSB" (per aplay's DSD_U32_BE description).
+// DSF stores bits LSB-first (oldest sample in bit 0), so each byte must be
+// bit-reversed. The 4 bytes are then written directly in big-endian order
+// (earliest byte to lowest address) — NOT assembled into a native uint32, which
+// would be stored little-endian on x86 and scramble the byte order.
+size_t dsd_read_native_u32be(DSDDecoder* decoder, size_t frames_to_read, void* buffer) {
+    if (!decoder || !buffer || frames_to_read == 0) return 0;
+
+    uint8_t* out = (uint8_t*)buffer;
+    size_t frames_written = 0;
+    size_t block_size_bits = decoder->block_size_bytes * DSD_SAMPLES_PER_BYTE;
+
+    for (size_t f = 0; f < frames_to_read; ++f) {
+        // Check block boundary ONCE per frame, before reading any channel, so all
+        // channels stay synchronized to the same bit position within the block.
+        if (decoder->current_dsd_bit_index + 32 > block_size_bits) {
+            if (!dsd_load_next_block(decoder)) goto done;
+            // dsd_load_next_block resets current_dsd_bit_index to 0
+        }
+
+        size_t byte_idx = decoder->current_dsd_bit_index / 8;
+
+        for (int ch = 0; ch < decoder->channels; ++ch) {
+            const uint8_t* ch_data = decoder->block_buffer + (ch * decoder->block_size_bytes);
+            uint8_t* dst = out + (f * decoder->channels + ch) * 4;
+            // DSF stores DSD LSB-first (DSD_LSBF_PLANAR); DSD_U32_BE wants MSB-first
+            // ("oldest bits in MSB"), so bit-reverse each byte. Bytes are written
+            // directly in big-endian order (earliest byte at lowest address) — not
+            // assembled into a native uint32, which would store little-endian on x86.
+            dst[0] = dsd_bitrev8(ch_data[byte_idx + 0]);
+            dst[1] = dsd_bitrev8(ch_data[byte_idx + 1]);
+            dst[2] = dsd_bitrev8(ch_data[byte_idx + 2]);
+            dst[3] = dsd_bitrev8(ch_data[byte_idx + 3]);
+        }
+
+        decoder->current_dsd_bit_index += 32;
+        decoder->pcm_frames_processed++;
+        frames_written++;
+    }
+
+done:
+    return frames_written;
 }
 
 #endif // DSD_DECODER_IMPLEMENTATION

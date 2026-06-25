@@ -15,6 +15,11 @@
 #define ALSA_PCM_NEW_HW_PARAMS_API
 #include <alsa/asoundlib.h>
 
+// Native DSD format — may not be defined in older ALSA headers.
+#ifndef SND_PCM_FORMAT_DSD_U32_BE
+#define SND_PCM_FORMAT_DSD_U32_BE ((snd_pcm_format_t)52)
+#endif
+
 typedef struct {
 	snd_pcm_t *handle;
 	snd_pcm_uframes_t frames;
@@ -163,7 +168,15 @@ static int AUDIO_init_auto(AUDIO *thiz, char *dev, unsigned int freq, int ch, in
 	// Allow up to 2Hz of rate fuzz from snd_pcm_hw_params_set_rate_near rounding.
 	#define RATE_FUZZ 2
 
-	if (AUDIO_init(thiz, dev, freq, ch, frames, flag, format) == 0) {
+	// Scale period size to maintain at least ~5ms per period at any sample rate.
+	// At 32 frames, 192kHz gives only 166µs — smaller than the USB 125µs packet
+	// interval — causing silent continuous underruns with no ALSA error reported.
+	// Minimum frames = rate * 0.005 (5ms), rounded up to next power of two.
+	unsigned int min_frames = freq / 200; // freq * 0.005
+	unsigned int scaled_frames = frames;
+	while (scaled_frames < min_frames) scaled_frames *= 2;
+
+	if (AUDIO_init(thiz, dev, freq, ch, scaled_frames, flag, format) == 0) {
 		unsigned int diff = thiz->actual_rate > freq
 		                  ? thiz->actual_rate - freq
 		                  : freq - thiz->actual_rate;
@@ -191,9 +204,8 @@ static int AUDIO_init_auto(AUDIO *thiz, char *dev, unsigned int freq, int ch, in
 	// plughw does not support float; convert to S32_LE which it handles natively.
 	int fallback_format = (format == SND_PCM_FORMAT_FLOAT_LE) ? SND_PCM_FORMAT_S32_LE : format;
 
-	// Use a larger period on plughw to give the plugin layer enough headroom and
-	// avoid underruns caused by the extra processing latency.
-	int fallback_frames = frames < 1024 ? 1024 : frames;
+	// Use a larger period on plughw — at least 1024 frames or the scaled value.
+	int fallback_frames = scaled_frames < 1024 ? 1024 : scaled_frames;
 
 	fprintf(stderr, "notice: falling back to %s (format=%s, period=%d) for hw conversion\n",
 	        fallback,
@@ -254,5 +266,30 @@ static void AUDIO_close(AUDIO *thiz)
 	snd_pcm_drain(thiz->handle);
 	snd_pcm_close(thiz->handle);
 	free(thiz->buffer);
+}
+
+// Check whether a device supports a given native DSD format at the given rate.
+// Returns 1 if supported, 0 otherwise. Only meaningful for hw: devices —
+// PipeWire/plughw will not expose native DSD formats.
+static int AUDIO_supports_dsd(char *dev, int dsd_format, unsigned int rate, int ch)
+{
+	snd_pcm_t *handle;
+	if (snd_pcm_open(&handle, dev, SND_PCM_STREAM_PLAYBACK, 0) < 0) {
+		return 0;
+	}
+	snd_pcm_hw_params_t *params;
+	snd_pcm_hw_params_alloca(&params);
+	if (snd_pcm_hw_params_any(handle, params) < 0) {
+		snd_pcm_close(handle);
+		return 0;
+	}
+
+	int supported = 1;
+	if (snd_pcm_hw_params_test_format(handle, params, (snd_pcm_format_t)dsd_format) < 0) supported = 0;
+	if (supported && snd_pcm_hw_params_test_rate(handle, params, rate, 0) < 0) supported = 0;
+	if (supported && snd_pcm_hw_params_test_channels(handle, params, ch) < 0) supported = 0;
+
+	snd_pcm_close(handle);
+	return supported;
 }
 
