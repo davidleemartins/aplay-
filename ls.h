@@ -156,6 +156,8 @@ LS_LIST *ls_dir(char *_dir, int flag, int *num)
 	char dir[PATH_MAX+1];
 	realpath(_dir, dir);
 
+	*num = 0;	// always define the out-param, even on the early returns below
+
 	int n = ls_count_dir(dir, flag)+1; // FIXME: +1 ??
 	if (!n) {
 		fprintf(stderr, "No file found in %s\n", dir);
@@ -168,7 +170,10 @@ LS_LIST *ls_dir(char *_dir, int flag, int *num)
 		return 0;
 	}
 
-	if (!ls_seek_dir(dir, ls, flag, 0)) return 0;
+	// ls_seek_dir returns the file count; 0 is valid (e.g. a dir of only
+	// subdirs), not an error. Keep the (possibly empty) array so callers can
+	// iterate it safely instead of getting a NULL with an unset count.
+	ls_seek_dir(dir, ls, flag, 0);
 
 	if (flag & LS_RANDOM) {
 #ifdef RANDOM_H
@@ -208,7 +213,7 @@ char *findExt(char *path)
 	char *e = &ext[9];
 	*e-- = 0;
 	int len = strlen(path)-1;
-	for (int i=len; i>len-9; i--) {
+	for (int i=len; i>=0 && i>len-9; i--) {	// i>=0: never read before the string
 		if (path[i] == '.' ) break;
 		*e-- = tolower(path[i]);
 	}

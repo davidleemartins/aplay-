@@ -9,7 +9,7 @@ endif
 ifneq (, $(shell which icc))
 CC = icc
 endif
-CFLAGS = -O3 -ffunction-sections -fdata-sections -funroll-loops -finline-functions -ftree-vectorize \
+CFLAGS = -O3 -g -ffunction-sections -fdata-sections -funroll-loops -finline-functions -ftree-vectorize \
          -Wall -Wextra -Wno-unused-parameter \
          -Wno-unused-result \
          -Wno-unused-function \
@@ -18,7 +18,10 @@ CFLAGS = -O3 -ffunction-sections -fdata-sections -funroll-loops -finline-functio
          -Wno-missing-field-initializers \
          -Wno-aggressive-loop-optimizations \
          -Wno-stringop-overflow
-LDFLAGS = -lasound -lm -Wl,-s -Wl,--gc-sections
+# Keep symbols (-g above, no strip) and export them (-rdynamic) so the built-in
+# crash handler prints a readable backtrace. For a smaller release binary, strip
+# with:  strip aplay+    (or re-add -Wl,-s to LDFLAGS).
+LDFLAGS = -lasound -lm -rdynamic -Wl,--gc-sections
 
 .PHONY: all
 all: $(PROGRAM)
