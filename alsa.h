@@ -1,5 +1,6 @@
 /* public domain Simple, Minimalistic, Audio library for ALSA
  *	©2017,2020 Yuichiro Nakada
+ *	Modifications ©2026 David Lee Martins
  *
  * Basic usage:
  *	AUDIO a;
@@ -160,8 +161,56 @@ static int device_will_silently_resample(const char *dev, unsigned int freq)
 	return resampling;
 }
 
+// Human-readable name for the ALSA output sample format.
+static const char *pcm_fmt_name(int f)
+{
+	switch (f) {
+	case SND_PCM_FORMAT_FLOAT_LE: return "FLOAT 32bit";
+	case SND_PCM_FORMAT_S32_LE:   return "S32 32bit";
+	case SND_PCM_FORMAT_S16_LE:   return "S16 16bit";
+	default:                      return "PCM";
+	}
+}
+
+// Format a rate in kHz: 176400 -> "176.4", 48000 -> "48", 44100 -> "44.1".
+static const char *khz_str(char *buf, size_t n, unsigned int rate)
+{
+	if (rate % 1000 == 0) snprintf(buf, n, "%u", rate / 1000);
+	else                  snprintf(buf, n, "%.1f", rate / 1000.0);
+	return buf;
+}
+
+// Can dev be opened at all right now? (false = unplugged/missing/busy.)
+static int device_available(const char *dev)
+{
+	snd_pcm_t *h;
+	if (snd_pcm_open(&h, dev, SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK) < 0) return 0;
+	snd_pcm_close(h);
+	return 1;
+}
+
+// Does dev support this exact rate natively? Used to tell a format-only
+// conversion (rate supported) from genuine resampling (rate not supported).
+static int device_supports_rate(const char *dev, unsigned int rate)
+{
+	snd_pcm_t *h;
+	if (snd_pcm_open(&h, dev, SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK) < 0) return 0;
+	snd_pcm_hw_params_t *p;
+	snd_pcm_hw_params_alloca(&p);
+	int ok = 0;
+	if (snd_pcm_hw_params_any(h, p) >= 0)
+		ok = (snd_pcm_hw_params_test_rate(h, p, rate, 0) == 0);
+	snd_pcm_close(h);
+	return ok;
+}
+
 // Try to open dev as-is; if it fails or negotiates the wrong rate/format, automatically
 // retry with plughw: so ALSA's plugin layer handles resampling/format conversion.
+// Prints a one-line playback-status indicator (color carries severity):
+//   green  ● BIT PERFECT          hw:, native rate, no app DSP
+//   yellow ◆ MODIFIED · …         hw: native, but -V volume and/or -c crosstalk
+//   yellow ◆ FORMAT-CONVERTED     plughw, rate unchanged (format only)
+//   amber  ▲ RESAMPLED · A → B kHz plughw, sample rate changed (audible)
 // Returns 0 on success, 1 on failure.
 static int AUDIO_init_auto(AUDIO *thiz, char *dev, unsigned int freq, int ch, int frames, int flag, int format)
 {
@@ -176,45 +225,102 @@ static int AUDIO_init_auto(AUDIO *thiz, char *dev, unsigned int freq, int ch, in
 	unsigned int scaled_frames = frames;
 	while (scaled_frames < min_frames) scaled_frames *= 2;
 
-	if (AUDIO_init(thiz, dev, freq, ch, scaled_frames, flag, format) == 0) {
+	// Probe the device up front so a dead/busy device gives a clear, actionable
+	// error instead of a confusing cascade of open failures — and so we don't
+	// attempt a plughw fallback that would fail for the very same reason. A clean
+	// open/close also leaves the device in a proper state.
+	snd_pcm_t *probe;
+	int orc = snd_pcm_open(&probe, dev,
+	                       flag ? SND_PCM_STREAM_PLAYBACK : SND_PCM_STREAM_CAPTURE, 0);
+	if (orc < 0) {
+		if (orc == -EBUSY) {
+			fprintf(stderr, "error: device '%s' is busy (in use by another program).\n", dev);
+		} else if (orc == -ENOENT || orc == -ENODEV) {
+			fprintf(stderr, "error: device '%s' not found — unplugged? Run 'aplay+ -S' to choose another.\n", dev);
+		} else {
+			fprintf(stderr, "error: cannot open device '%s': %s\n", dev, snd_strerror(orc));
+		}
+		return 1;
+	}
+	snd_pcm_close(probe);	// reachable — release it before the real open
+
+	// Try the device as-is for bit-perfect playback.
+	int resampling = 0;	// will plughw change the sample rate (vs format only)?
+	unsigned int dev_rate = 0;	// device's nearest rate, when known
+	int rc = AUDIO_init(thiz, dev, freq, ch, scaled_frames, flag, format);
+	if (rc == 0) {
 		unsigned int diff = thiz->actual_rate > freq
 		                  ? thiz->actual_rate - freq
 		                  : freq - thiz->actual_rate;
 		if (diff <= RATE_FUZZ) {
 			thiz->actual_format = format ? format : SND_PCM_FORMAT_S16_LE;
-			return 0; // close enough — no fallback needed
+			const char *fmt = pcm_fmt_name(thiz->actual_format);
+			int dsp = (volume != 1.0f) || crosstalk;
+			if (strncmp(dev, "hw:", 3) == 0 && !dsp) {
+				printf("%s\xe2\x97\x8f BIT PERFECT\e[0m %s(with %s)\e[0m\n",
+				       theme.accent, theme.hint, fmt);
+			} else if (strncmp(dev, "hw:", 3) == 0) {
+				const char *what = (volume != 1.0f && crosstalk) ? "volume + crosstalk"
+				    : (volume != 1.0f) ? "software volume" : "crosstalk";
+				printf("%s\xe2\x97\x86 MODIFIED \xc2\xb7 %s\e[0m %s(with %s)\e[0m\n",
+				       theme.warn, what, theme.hint, fmt);
+			} else {
+				// User passed a plughw/other device directly — goes through the
+				// plug layer (format conversion possible), so not bit-perfect.
+				printf("%s\xe2\x97\x86 FORMAT-CONVERTED\e[0m %s(with %s)\e[0m\n",
+				       theme.warn, theme.hint, fmt);
+			}
+			fflush(stdout);
+			return 0; // device plays this stream natively
 		}
-		// Rate genuinely unsupported — close and fall through to plughw.
+		// Opened, but can't run at the source's native rate — plughw will resample.
+		dev_rate = thiz->actual_rate;
+		resampling = 1;
 		AUDIO_close(thiz);
+	} else {
+		// Open/params failed without a rate negotiation. If the device supports
+		// the source rate, plughw only converts format; otherwise it resamples.
+		resampling = !device_supports_rate(dev, freq);
 	}
 
-	// Build plughw: equivalent for the fallback device.
-	// "hw:X,Y"   -> "plughw:X,Y"
-	// "plughw:*" -> keep as-is (already a plugin device; retry in case format was the issue)
-	// anything else (default, pulse, pipewire…) -> "plughw:1,0"
+	// Build a plughw fallback for the SAME device so ALSA's plug layer handles
+	// rate/format conversion. We never guess a different card, and never fall
+	// back to the pulse/'default' plugin.
 	char fallback[64];
 	if (strncmp(dev, "hw:", 3) == 0) {
-		snprintf(fallback, sizeof(fallback), "plug%s", dev);
+		snprintf(fallback, sizeof(fallback), "plug%s", dev);	// hw:X,Y -> plughw:X,Y
 	} else if (strncmp(dev, "plughw:", 7) == 0) {
-		snprintf(fallback, sizeof(fallback), "%s", dev);
+		snprintf(fallback, sizeof(fallback), "%s", dev);	// already a plug device
 	} else {
-		snprintf(fallback, sizeof(fallback), "plughw:1,0");
+		fprintf(stderr,
+		        "error: '%s' can't play this stream and is not a hw:/plughw: device,\n"
+		        "       so no conversion fallback applies. Choose a hw:X,Y device (aplay+ -L).\n",
+		        dev);
+		return 1;
 	}
 
-	// plughw does not support float; convert to S32_LE which it handles natively.
+	// plughw cannot output float; request S32_LE, which it converts to natively.
 	int fallback_format = (format == SND_PCM_FORMAT_FLOAT_LE) ? SND_PCM_FORMAT_S32_LE : format;
-
-	// Use a larger period on plughw — at least 1024 frames or the scaled value.
 	int fallback_frames = scaled_frames < 1024 ? 1024 : scaled_frames;
 
-	fprintf(stderr, "notice: falling back to %s (format=%s, period=%d) for hw conversion\n",
-	        fallback,
-	        fallback_format == SND_PCM_FORMAT_S32_LE ? "S32_LE" : "S16_LE",
-	        fallback_frames);
-
-	int rc = AUDIO_init(thiz, fallback, freq, ch, fallback_frames, flag, fallback_format);
+	rc = AUDIO_init(thiz, fallback, freq, ch, fallback_frames, flag, fallback_format);
 	if (rc == 0) {
-		thiz->actual_format = fallback_format;
+		// Normalize 0 ("ALSA default") to S16_LE, matching what AUDIO_init uses,
+		// so the indicator shows "S16 16bit" rather than a generic "PCM".
+		thiz->actual_format = fallback_format ? fallback_format : SND_PCM_FORMAT_S16_LE;
+		const char *fmt = pcm_fmt_name(thiz->actual_format);
+		char a[16], b[16];
+		if (resampling && dev_rate)
+			printf("%s\xe2\x96\xb2 RESAMPLED \xc2\xb7 %s \xe2\x86\x92 %s kHz\e[0m %s(with %s)\e[0m\n",
+			       theme.alert, khz_str(a, sizeof a, freq), khz_str(b, sizeof b, dev_rate),
+			       theme.hint, fmt);
+		else if (resampling)
+			printf("%s\xe2\x96\xb2 RESAMPLED \xc2\xb7 %s kHz source\e[0m %s(with %s)\e[0m\n",
+			       theme.alert, khz_str(a, sizeof a, freq), theme.hint, fmt);
+		else
+			printf("%s\xe2\x97\x86 FORMAT-CONVERTED\e[0m %s(with %s)\e[0m\n",
+			       theme.warn, theme.hint, fmt);
+		fflush(stdout);
 	}
 	return rc;
 }
@@ -242,7 +348,6 @@ static int AUDIO_play(AUDIO *thiz, char *data, int frames)
 		// EPIPE means overrun
 		fprintf(stderr, "overrun occurred\n");
 		snd_pcm_recover(thiz->handle, rc, 0);
-		//snd_pcm_prepare(thiz->handle);
 	} else if (rc < 0) {
 		fprintf(stderr, "write failed (%s)\n", snd_strerror(rc));
 	} else if (rc != frames) {
@@ -263,9 +368,13 @@ static void AUDIO_wait(AUDIO *thiz, int msec)
 
 static void AUDIO_close(AUDIO *thiz)
 {
-	snd_pcm_drain(thiz->handle);
+	// On a user interrupt (skip/quit) drop the buffered audio so the keypress is
+	// responsive; on natural track end, drain so the tail plays out.
+	if (g_interrupt) snd_pcm_drop(thiz->handle);
+	else             snd_pcm_drain(thiz->handle);
 	snd_pcm_close(thiz->handle);
 	free(thiz->buffer);
+	g_interrupt = 0;
 }
 
 // Check whether a device supports a given native DSD format at the given rate.

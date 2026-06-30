@@ -13603,9 +13603,7 @@ uint8_t *uaac_extract_aac(int fd, int *len, int *samplerate, int *channels, int 
         sbr_enabled = 1;
         output_samplerate *= 2;
         *profile_out = 5;  // HE-AAC
-        printf("Detected HE-AAC with SBR, core samplerate: %uHz, output: %uHz\n", *samplerate, output_samplerate);
-    } else {
-        printf("Extracted AAC: %uHz, %dch\n", *samplerate, *channels);
+        // (diagnostic prints removed — play_aac() shows the now-playing line)
     }
     return data;
 }

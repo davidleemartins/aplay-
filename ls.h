@@ -1,5 +1,6 @@
 /* public domain Simple, Minimalistic, making list of files and directories
  *	©2017-2025 Yuichiro Nakada
+ *	Modifications ©2026 David Lee Martins
  *
  * Basic usage:
  *	int num;
@@ -17,7 +18,6 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
-//#define RANDOM_DEVICE "/dev/random"
 #define RANDOM_DEVICE "/dev/urandom"
 int urandom;
 void urandom_init()
@@ -38,23 +38,6 @@ void urandom_end()
 {
 	close(urandom);
 }
-/*static FILE *urandom;
-inline void urandom_init()
-{
-	urandom = fopen(RANDOM_DEVICE, "rb");
-	if (urandom == NULL) {
-		fprintf(stderr, "Failed to open %s\n", RANDOM_DEVICE);
-		exit(EXIT_FAILURE);
-	}
-}
-inline int urandom_number()
-{
-	return fgetc(urandom);
-}
-inline void urandom_end()
-{
-	fclose(urandom);
-}*/
 
 #define LS_RECURSIVE	1
 #define LS_RANDOM	2
@@ -94,7 +77,6 @@ int ls_count_dir(char *dir, int flag)
 
 		i++;
 	}
-	//printf("%s => %d\n", dir, i);
 
 	closedir(dp);
 	chdir(cpath);
@@ -130,7 +112,6 @@ int ls_seek_dir(char *dir, LS_LIST *ls, int flag, int n)
 			(ls+i)->count = 0; // dir
 			(ls+i)->dir = ++n;
 
-			//if (flag & LS_RECURSIVE) i += ls_seek_dir(buf, ls+i+1, flag);
 			if (flag & LS_RECURSIVE) i += ls_seek_dir(buf, ls+i, flag, n);
 		} else {
 			i++;
@@ -146,15 +127,47 @@ int ls_seek_dir(char *dir, LS_LIST *ls, int flag, int n)
 	return i;
 }
 
+// Natural-order, case-insensitive compare: runs of digits compare by numeric
+// value, so "2" sorts before "10" (e.g. track numbers) instead of lexically,
+// and letters compare regardless of case.
+static int ls_lower(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+int ls_natcmp(const char *a, const char *b)
+{
+	while (*a && *b) {
+		int da = (*a >= '0' && *a <= '9');
+		int db = (*b >= '0' && *b <= '9');
+		if (da && db) {
+			while (*a == '0') a++;	// skip leading zeros
+			while (*b == '0') b++;
+			const char *ae = a, *be = b;
+			while (*ae >= '0' && *ae <= '9') ae++;
+			while (*be >= '0' && *be <= '9') be++;
+			int alen = ae - a, blen = be - b;
+			if (alen != blen) return alen - blen;	// longer number is larger
+			while (a < ae) {
+				if (*a != *b) return (unsigned char)*a - (unsigned char)*b;
+				a++; b++;
+			}
+		} else {
+			int ca = ls_lower((unsigned char)*a), cb = ls_lower((unsigned char)*b);
+			if (ca != cb) return ca - cb;
+			a++; b++;
+		}
+	}
+	return ls_lower((unsigned char)*a) - ls_lower((unsigned char)*b);
+}
+
 int ls_comp_func(const void *a, const void *b)
 {
-	return (strcmp((char*)(((LS_LIST*)a)->d_name), (char*)(((LS_LIST*)b)->d_name)));
+	return ls_natcmp((char*)(((LS_LIST*)a)->d_name), (char*)(((LS_LIST*)b)->d_name));
 }
 
 LS_LIST *ls_dir(char *_dir, int flag, int *num)
 {
 	char dir[PATH_MAX+1];
 	realpath(_dir, dir);
+
+	*num = 0;	// always define the out-param, even on the early returns below
 
 	int n = ls_count_dir(dir, flag)+1; // FIXME: +1 ??
 	if (!n) {
@@ -168,19 +181,19 @@ LS_LIST *ls_dir(char *_dir, int flag, int *num)
 		return 0;
 	}
 
-	if (!ls_seek_dir(dir, ls, flag, 0)) return 0;
+	// ls_seek_dir returns the file count; 0 is valid (e.g. a dir of only
+	// subdirs), not an error. Keep the (possibly empty) array so callers can
+	// iterate it safely instead of getting a NULL with an unset count.
+	ls_seek_dir(dir, ls, flag, 0);
 
 	if (flag & LS_RANDOM) {
 #ifdef RANDOM_H
-//		xor128_init(time(NULL));
 		urandom_init();
 #else
 		srand(time(NULL));
 #endif
 		for (int i=n-1; i>0; i--) { // Fisher-Yates shuffle
 #ifdef RANDOM_H
-//			int a = frand() * n;
-//			int a = (prand32() / 4294967295.0)*n;
 			uint32_t r = urandom_number();
 			int a = r % (i + 1); // Ensure a is in range [0, i]
 #else
@@ -208,23 +221,9 @@ char *findExt(char *path)
 	char *e = &ext[9];
 	*e-- = 0;
 	int len = strlen(path)-1;
-	for (int i=len; i>len-9; i--) {
+	for (int i=len; i>=0 && i>len-9; i--) {	// i>=0: never read before the string
 		if (path[i] == '.' ) break;
 		*e-- = tolower(path[i]);
 	}
 	return e+1;
 }
-
-#if 0
-int main(int argc, char *argv[])
-{
-	int num = 0;
-	LS_LIST *ls = ls_dir(argv[1], LS_RECURSIVE, &num);
-	for (int i=0; i<num; i++) {
-		printf("%s\n", ls[i].d_name);
-	}
-	free(ls);
-
-	return 0;
-}
-#endif
