@@ -4,6 +4,38 @@ A minimal, bit-perfect command-line audio player for Linux built on ALSA. Suppor
 lossless and compressed formats using single-header C libraries — no heavyweight
 dependencies, no daemon, no GUI.
 
+> A fork of [**aplay+**](https://github.com/yui0/aplay-) by Yuichiro Nakada, extended by **David Lee Martins** (2026):
+> a ranger-like pre-playback file browser, natural + case-insensitive sort,
+> per-track now-playing metadata, explicit device selection with persistence and
+> auto-recovery on unplug, a four-state bit-perfect/conversion indicator, color
+> theming, and `.m3u`/`.m3u8` playback. Released under the same MIT license.
+
+---
+
+## What's different in this fork
+
+This fork builds on Yuichiro Nakada's original aplay+ with a focus on everyday
+usability while keeping the bit-perfect, zero-dependency core intact:
+
+- **File browser** — a ranger-like, full-screen terminal chooser (no ncurses) is
+  now the default; `-n` opts back into direct playback.
+- **Natural, case-insensitive sort** — track numbers order 1→2→…→10 instead of
+  lexically, regardless of case.
+- **Explicit device selection** — pick your DAC once (interactive picker),
+  persisted to `~/.config/aplay+/device`; auto-recovery if a USB DAC is unplugged.
+  No silent default/pulse guessing.
+- **Bit-perfect status indicator** — a four-state line (BIT PERFECT / MODIFIED /
+  FORMAT-CONVERTED / RESAMPLED) tells you honestly what the DAC is doing.
+- **Now-playing metadata** — title/artist/album for all formats; duration where
+  it's cheap to compute.
+- **Color theming** — built-in presets (incl. dracula) + config overrides.
+- **Playlist playback** — `.m3u` / `.m3u8` (read-only).
+- **Stability & cleanup** — fixed navigation crashes and input-lag on skip/quit,
+  and removed dead code.
+
+See [LICENSE](LICENSE) for copyright. Original project:
+[github.com/yui0/aplay-](https://github.com/yui0/aplay-).
+
 ---
 
 ## Supported Formats
@@ -624,4 +656,10 @@ needed beyond ALSA:
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
+
+- Copyright (c) 2023 Yuichiro Nakada — original aplay+
+- Copyright (c) 2026 David Lee Martins — this fork
+
+The bundled single-header libraries listed under [Dependencies](#dependencies)
+retain their own respective licenses.

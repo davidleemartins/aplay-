@@ -1,5 +1,5 @@
 /* Tier 1 pre-playback file browser for aplay+
- *	©2026 — hand-rolled full-screen ANSI directory chooser, no ncurses.
+ *	©2026 David Lee Martins — hand-rolled full-screen ANSI directory chooser, no ncurses.
  *
  * A ranger-like terminal chooser used BEFORE playback: navigate directories,
  * press Enter on a dir/file to hand off to the existing blocking play_dir/
@@ -68,7 +68,7 @@ static int br_cmp(const void *a, const void *b)
 {
 	const BR_ENTRY *ea = a, *eb = b;
 	if (ea->is_dir != eb->is_dir) return eb->is_dir - ea->is_dir;
-	return strcasecmp(ea->name, eb->name);
+	return ls_natcmp(ea->name, eb->name);
 }
 
 static BR_ENTRY *br_read(const char *path, int *count)

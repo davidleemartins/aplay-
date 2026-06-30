@@ -1,5 +1,6 @@
 /* public domain Simple, Minimalistic, Audio library for ALSA
  *	©2017,2020 Yuichiro Nakada
+ *	Modifications ©2026 David Lee Martins
  *
  * Basic usage:
  *	AUDIO a;
@@ -347,7 +348,6 @@ static int AUDIO_play(AUDIO *thiz, char *data, int frames)
 		// EPIPE means overrun
 		fprintf(stderr, "overrun occurred\n");
 		snd_pcm_recover(thiz->handle, rc, 0);
-		//snd_pcm_prepare(thiz->handle);
 	} else if (rc < 0) {
 		fprintf(stderr, "write failed (%s)\n", snd_strerror(rc));
 	} else if (rc != frames) {

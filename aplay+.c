@@ -1,4 +1,5 @@
 // ©2017-2025 Yuichiro Nakada
+// Modifications © 2026 David Lee Martins
 // clang -Os -o aplay+ aplay+.c -lasound
 
 #include <stdio.h>
@@ -53,7 +54,6 @@ int g_interrupt = 0;	// set when a keypress stops the current track, so AUDIO_cl
 #include "minimp3.h"
 #endif
 #define HELIX_FEATURE_AUDIO_CODEC_AAC_SBR
-//#define AAC_ENABLE_SBR
 #include "uaac.h"
 #include "uwma.h"
 #include "stb_vorbis.h"
@@ -102,11 +102,9 @@ int key(AUDIO *a)
 	return c;
 }
 
-//char *dev = "default";  // "plughw:0,0"
 char *dev = "hw:0,0";  // BitPerfect
 
 #define FRAMES        32
-//#define FRAMES        128
 #define MAX_DELAY_SAMPLES 16 // Maximum delay samples for crosstalk (e.g., 71µs at 44.1kHz is ~3 samples)
 
 // Crosstalk cancellation parameters
@@ -118,16 +116,6 @@ typedef struct {
 	int delay_index;      // Current index in delay buffer
 } CrosstalkCancel;
 
-/*void init_crosstalk_cancellation(CrosstalkCancel *xtc, int sample_rate, int channels)
-{
-    if (channels != 2) return; // Only support stereo
-    xtc->delay_samples = (int)(sample_rate * 0.000071); // 71µs delay
-    xtc->attenuation = 0.4f; // Natural effect
-    xtc->delay_buffer_size = xtc->delay_samples * 2; // Stereo
-    if (xtc->delay_buffer_size < 2) xtc->delay_buffer_size = 2; // Ensure at least 2 samples for stereo
-    xtc->delay_buffer = (float*)calloc(xtc->delay_buffer_size, sizeof(float));
-    xtc->delay_index = 0;
-}*/
 void init_crosstalk_cancellation(CrosstalkCancel *xtc, int sample_rate, int channels)
 {
 	// Always clear delay_buffer first: callers keep `xtc` on the stack
@@ -189,40 +177,6 @@ void apply_crosstalk_cancellation(CrosstalkCancel *xtc, void *buffer, int frames
 			data[idx + 1] = fmaxf(fminf(new_right, 1.0f), -1.0f);
 		}
 	} else { // SND_PCM_FORMAT_S16_LE
-		/*int16_t *data = (int16_t*)buffer;
-		float temp[frames * 2];
-		float original_temp[frames * 2]; // Store original signal
-
-		// Convert int16 to float for processing
-		for (int i = 0; i < frames * 2; i++) {
-		    original_temp[i] = data[i] / 32768.0f;
-		}
-		memcpy(temp, original_temp, frames * 2 * sizeof(float));
-
-		// Process crosstalk cancellation
-		for (int i = 0; i < frames; i++) {
-		    int idx = i * 2;
-		    int delay_idx = (xtc->delay_index - xtc->delay_samples * 2 + xtc->delay_buffer_size) % xtc->delay_buffer_size;
-
-		    // Store current samples in delay buffer
-		    xtc->delay_buffer[xtc->delay_index] = original_temp[idx];     // Left
-		    xtc->delay_buffer[xtc->delay_index + 1] = original_temp[idx + 1]; // Right
-		    xtc->delay_index = (xtc->delay_index + 2) % xtc->delay_buffer_size;
-
-		    // Apply crosstalk cancellation
-		    float delayed_left = xtc->delay_buffer[delay_idx];
-		    float delayed_right = xtc->delay_buffer[delay_idx + 1];
-
-		    temp[idx] = original_temp[idx] - xtc->attenuation * delayed_right;
-		    temp[idx + 1] = original_temp[idx + 1] - xtc->attenuation * delayed_left;
-		}
-
-		for (int i = 0; i < frames * 2; i++) {
-		    float val = temp[i] * 32767.0f; // Use 32767.0f to avoid overflow
-		    if (val > 32767.0f) val = 32767.0f;
-		    if (val < -32768.0f) val = -32768.0f;
-		    data[i] = (int16_t)val;
-		}*/
 		int16_t *data = (int16_t*)buffer;
 		float temp[frames * 2];
 		for (int i = 0; i < frames * 2; i++) {
@@ -1247,237 +1201,6 @@ int play_wma(char *name, int flag)
 	return 0;
 }
 
-/*int play_aac(char *name, int flag)
-{
-    unsigned char *file_data;
-    unsigned char *stream_pos;
-    short sample_buf[AAC_BUF_SIZE*2];
-    int bytes_left;
-
-    int fd = open(name, O_RDONLY);
-    if (fd < 0) {
-        printf("Error: cannot open `%s`\n", name);
-        return 1;
-    }
-
-    int samplerate, channels;
-    file_data = uaac_extract_aac(fd, &bytes_left, &samplerate, &channels);
-    if (!file_data) {
-        printf("Error: cannot read AAC data\n");
-        close(fd);
-        return 1;
-    }
-    stream_pos = file_data;
-
-    AACFrameInfo info;
-    memset(&info, 0, sizeof(AACFrameInfo));
-    info.nChans = channels;
-    info.sampRateCore = samplerate;
-    info.profile = AAC_PROFILE_LC;
-
-    HAACDecoder aac = AACInitDecoder();
-    AACSetRawBlockParams(aac, 0, &info);
-
-    int output_samplerate = info.sampRateCore;
-    int sbr_enabled = 0;
-    if (output_samplerate <= 24000) {
-        output_samplerate *= 2;
-        sbr_enabled = 1;
-    }
-
-    printf("%dHz (output: %dHz) %dch\n", info.sampRateCore, output_samplerate, info.nChans);
-
-    AUDIO a;
-    if (AUDIO_init_auto(&a, dev, output_samplerate, info.nChans, FRAMES, 1, 0)) {
-        free(file_data);
-        close(fd);
-        AACFreeDecoder(aac);
-        return 1;
-    }
-
-    CrosstalkCancel xtc;
-    init_crosstalk_cancellation(&xtc, output_samplerate, info.nChans);
-
-    printf("\e[?25l");
-    while (bytes_left > 0) {
-        int r = AACDecode(aac, &stream_pos, &bytes_left, sample_buf);
-        printf("\r%d %d", (int)(stream_pos - file_data), bytes_left);
-        if (!r) {
-            AACGetLastFrameInfo(aac, &info);
-            if (flag & USE_CROSSTALK) apply_crosstalk_cancellation(&xtc, sample_buf, AAC_MAX_NSAMPS, info.nChans, 0);
-            AUDIO_play(&a, (char*)sample_buf, AAC_MAX_NSAMPS);
-        } else {
-            printf("\nAAC decode error %d, attempting resync\n", r);
-            if (!sbr_enabled && info.sampRateCore <= 24000) {
-                printf("Trying HE-AAC with SBR\n");
-                info.sampRateCore *= 2;
-                info.profile = 5; // HE-AAC
-                AACFreeDecoder(aac);
-                aac = AACInitDecoder();
-                AACSetRawBlockParams(aac, 0, &info);
-                stream_pos = file_data;
-                bytes_left = *(&bytes_left);
-                continue;
-            }
-            int nextSync = AACFindSyncWord(stream_pos, bytes_left);
-            if (nextSync >= 0) {
-                stream_pos += nextSync;
-                bytes_left -= nextSync;
-                continue;
-            } else {
-                printf("Failed to resync, stopping\n");
-                break;
-            }
-        }
-
-        int k = key(&a);
-        if (k=='c') flag ^= USE_CROSSTALK;
-        else if (k) break;
-    }
-    printf("\e[?25h");
-
-    AUDIO_close(&a);
-    AACFreeDecoder(aac);
-    free(file_data);
-    close(fd);
-    free_crosstalk_cancellation(&xtc);
-    return 0;
-}*/
-/*int play_aac(char *name, int flag)
-{
-	unsigned char *file_data;
-	unsigned char *stream_pos;
-	short sample_buf[AAC_BUF_SIZE*2];
-	int bytes_left;
-	int max_resync_attempts = 5;
-	int resync_attempts = 0;
-
-	int fd = open(name, O_RDONLY);
-	if (fd < 0) {
-		printf("Error: cannot open `%s`\n", name);
-		return 1;
-	}
-
-	int samplerate, channels, profile;
-	file_data = uaac_extract_aac(fd, &bytes_left, &samplerate, &channels, &profile);
-	if (!file_data) {
-		printf("Error: cannot read AAC data\n");
-		close(fd);
-		return 1;
-	}
-	stream_pos = file_data;
-
-	AACFrameInfo info;
-	memset(&info, 0, sizeof(AACFrameInfo));
-	info.nChans = channels;
-	info.sampRateCore = samplerate;
-	info.profile = profile;
-
-	HAACDecoder aac = AACInitDecoder();
-	AACSetRawBlockParams(aac, 0, &info);
-
-	int output_samplerate = samplerate;
-	int sbr_enabled = (profile == 5);
-	if (sbr_enabled) {
-	    output_samplerate *= 2;
-	} else if (samplerate <= 24000) {
-	    // Assume potential HE-AAC if low rate and not detected
-	    sbr_enabled = 1;
-	    info.profile = 5;
-	    output_samplerate *= 2;
-	    printf("Assuming potential HE-AAC with SBR, output samplerate: %dHz\n", output_samplerate);
-	}
-	printf("%dHz (output: %dHz) %dch\n", info.sampRateCore, output_samplerate, info.nChans);
-
-	AUDIO a;
-	if (AUDIO_init_auto(&a, dev, output_samplerate, info.nChans, FRAMES, 1, 0)) {
-		printf("Error: failed to initialize ALSA with %dHz, %dch\n", output_samplerate, info.nChans);
-		free(file_data);
-		close(fd);
-		AACFreeDecoder(aac);
-		return 1;
-	}
-
-	CrosstalkCancel xtc;
-	init_crosstalk_cancellation(&xtc, output_samplerate, info.nChans);
-
-	printf("\e[?25l");
-	while (bytes_left > 0) {
-		int r = AACDecode(aac, &stream_pos, &bytes_left, sample_buf);
-		if (verbose) {
-			printf("\rDecoded %d bytes, %d bytes left, result=%d\n", (int)(stream_pos - file_data), bytes_left, r);
-		} else {
-			printf("\r%d/%d", (int)(stream_pos - file_data), bytes_left + (int)(stream_pos - file_data));
-		}
-		if (!r) {
-			resync_attempts = 0; // Reset on successful decode
-			AACGetLastFrameInfo(aac, &info);
-			if (verbose) {
-				printf("Frame: %d samples, %d channels, %dHz\n", AAC_MAX_NSAMPS, info.nChans, info.sampRateCore);
-			}
-			if (flag & USE_CROSSTALK) {
-				apply_crosstalk_cancellation(&xtc, sample_buf, AAC_MAX_NSAMPS, info.nChans, 0);
-			}
-			AUDIO_play(&a, (char*)sample_buf, AAC_MAX_NSAMPS);
-		} else {
-			printf("\nAAC decode error %d, attempting resync (%d/%d)\n", r, resync_attempts + 1, max_resync_attempts);
-			if (!sbr_enabled && info.sampRateCore <= 24000) {
-				printf("Trying HE-AAC with SBR\n");
-				info.sampRateCore *= 2;
-				info.profile = 5; // HE-AAC
-				AACFreeDecoder(aac);
-				aac = AACInitDecoder();
-				AACSetRawBlockParams(aac, 0, &info);
-				stream_pos = file_data;
-				bytes_left = *(&bytes_left);
-				resync_attempts = 0;
-				// Reinitialize ALSA with new sample rate
-				AUDIO_close(&a);
-				if (AUDIO_init_auto(&a, dev, info.sampRateCore, info.nChans, FRAMES, 1, 0)) {
-					printf("Error: failed to reinitialize ALSA with %dHz\n", info.sampRateCore);
-					free(file_data);
-					close(fd);
-					AACFreeDecoder(aac);
-					free_crosstalk_cancellation(&xtc);
-					return 1;
-				}
-				continue;
-			}
-			int nextSync = AACFindSyncWord(stream_pos, bytes_left);
-			if (nextSync >= 0) {
-				stream_pos += nextSync;
-				bytes_left -= nextSync;
-				resync_attempts = 0;
-				continue;
-			} else if (++resync_attempts < max_resync_attempts) {
-				stream_pos += 1;
-				bytes_left -= 1;
-				if (verbose) {
-					printf("Skipping 1 byte, %d bytes left\n", bytes_left);
-				}
-				continue;
-			} else {
-				printf("Failed to resync after %d attempts, stopping\n", max_resync_attempts);
-				break;
-			}
-		}
-
-		int k = key(&a);
-		if (k=='c') {
-			flag ^= USE_CROSSTALK;
-		} else if (k) {
-			break;
-		}
-	}
-	printf("\e[?25h");
-
-	AUDIO_close(&a);
-	AACFreeDecoder(aac);
-	free(file_data);
-	close(fd);
-	free_crosstalk_cancellation(&xtc);
-	return 0;
-}*/
 int play_aac(char *name, int flag)
 {
     unsigned char *file_data;
@@ -1639,7 +1362,6 @@ void play_dir(char *name, char *type, char *regexp, int flag, const char *start)
 			}
 			if (regexp) {
 				const char *error;
-				//Reprog *p = regcomp(regexp, 0, &error);
 				Reprog *p = regcomp(regexp, REG_ICASE, &error);
 				if (!p) {
 					fprintf(stderr, "regcomp: %s\n", error);

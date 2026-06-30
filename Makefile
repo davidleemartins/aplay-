@@ -1,4 +1,5 @@
 # ©2017-2025 YUICHIRO NAKADA
+# Modifications ©2026 David Lee Martins
 
 PROGRAM = $(patsubst %.c,%,$(wildcard *.c))
 HEAD    = $(wildcard *.h)
