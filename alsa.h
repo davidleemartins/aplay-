@@ -28,7 +28,14 @@ typedef struct {
 	int size;
 	unsigned int actual_rate;   // rate negotiated by ALSA (may differ from requested)
 	int actual_format;          // format negotiated by AUDIO_init_auto (may differ from requested)
+	int can_pause;              // hardware supports snd_pcm_pause (many USB DACs don't)
 } AUDIO;
+
+// Device-name classification helpers (used for the bit-perfect indicator, the
+// plughw fallback and native-DSD probing).
+static int dev_is_hw(const char *dev)   { return strncmp(dev, "hw:", 3) == 0; }
+static int dev_is_plug(const char *dev) { return strncmp(dev, "plughw:", 7) == 0; }
+static int dev_is_hw_or_plug(const char *dev) { return dev_is_hw(dev) || dev_is_plug(dev); }
 
 static int AUDIO_init(AUDIO *thiz, char *dev, unsigned int freq, int ch, int frames, int flag, int format)
 {
@@ -112,6 +119,10 @@ static int AUDIO_init(AUDIO *thiz, char *dev, unsigned int freq, int ch, int fra
 		snd_pcm_close(thiz->handle);
 		return 1;
 	}
+
+	// Whether the hardware supports pause — key()'s space handler emulates
+	// pause with drop+prepare when it doesn't (common on USB DACs).
+	thiz->can_pause = snd_pcm_hw_params_can_pause(params);
 
 	// 4 bytes/sample covers S32_LE and FLOAT_LE; S16_LE uses half the buffer safely.
 	thiz->size = thiz->frames * 4 * ch;
@@ -208,7 +219,7 @@ static int device_supports_rate(const char *dev, unsigned int rate)
 // retry with plughw: so ALSA's plugin layer handles resampling/format conversion.
 // Prints a one-line playback-status indicator (color carries severity):
 //   green  ● BIT PERFECT          hw:, native rate, no app DSP
-//   yellow ◆ MODIFIED · …         hw: native, but -V volume and/or -c crosstalk
+//   yellow ◆ MODIFIED · crosstalk hw: native, but -c crosstalk alters samples
 //   yellow ◆ FORMAT-CONVERTED     plughw, rate unchanged (format only)
 //   amber  ▲ RESAMPLED · A → B kHz plughw, sample rate changed (audible)
 // Returns 0 on success, 1 on failure.
@@ -255,15 +266,12 @@ static int AUDIO_init_auto(AUDIO *thiz, char *dev, unsigned int freq, int ch, in
 		if (diff <= RATE_FUZZ) {
 			thiz->actual_format = format ? format : SND_PCM_FORMAT_S16_LE;
 			const char *fmt = pcm_fmt_name(thiz->actual_format);
-			int dsp = (volume != 1.0f) || crosstalk;
-			if (strncmp(dev, "hw:", 3) == 0 && !dsp) {
+			if (dev_is_hw(dev) && !crosstalk) {
 				printf("%s\xe2\x97\x8f BIT PERFECT\e[0m %s(with %s)\e[0m\n",
 				       theme.accent, theme.hint, fmt);
-			} else if (strncmp(dev, "hw:", 3) == 0) {
-				const char *what = (volume != 1.0f && crosstalk) ? "volume + crosstalk"
-				    : (volume != 1.0f) ? "software volume" : "crosstalk";
-				printf("%s\xe2\x97\x86 MODIFIED \xc2\xb7 %s\e[0m %s(with %s)\e[0m\n",
-				       theme.warn, what, theme.hint, fmt);
+			} else if (dev_is_hw(dev)) {
+				printf("%s\xe2\x97\x86 MODIFIED \xc2\xb7 crosstalk\e[0m %s(with %s)\e[0m\n",
+				       theme.warn, theme.hint, fmt);
 			} else {
 				// User passed a plughw/other device directly — goes through the
 				// plug layer (format conversion possible), so not bit-perfect.
@@ -287,9 +295,9 @@ static int AUDIO_init_auto(AUDIO *thiz, char *dev, unsigned int freq, int ch, in
 	// rate/format conversion. We never guess a different card, and never fall
 	// back to the pulse/'default' plugin.
 	char fallback[64];
-	if (strncmp(dev, "hw:", 3) == 0) {
+	if (dev_is_hw(dev)) {
 		snprintf(fallback, sizeof(fallback), "plug%s", dev);	// hw:X,Y -> plughw:X,Y
-	} else if (strncmp(dev, "plughw:", 7) == 0) {
+	} else if (dev_is_plug(dev)) {
 		snprintf(fallback, sizeof(fallback), "%s", dev);	// already a plug device
 	} else {
 		fprintf(stderr,
@@ -345,10 +353,13 @@ static int AUDIO_play(AUDIO *thiz, char *data, int frames)
 {
 	int rc = snd_pcm_writei(thiz->handle, data, frames);
 	if (rc == -EPIPE) {
-		// EPIPE means overrun
-		fprintf(stderr, "overrun occurred\n");
+		// EPIPE on playback means underrun. Recover and rewrite the chunk once
+		// so the audio it carried isn't dropped.
+		fprintf(stderr, "underrun occurred\n");
 		snd_pcm_recover(thiz->handle, rc, 0);
-	} else if (rc < 0) {
+		rc = snd_pcm_writei(thiz->handle, data, frames);
+	}
+	if (rc < 0) {
 		fprintf(stderr, "write failed (%s)\n", snd_strerror(rc));
 	} else if (rc != frames) {
 		fprintf(stderr, "short write, write %d/%d frames\n", rc, (int)thiz->frames);

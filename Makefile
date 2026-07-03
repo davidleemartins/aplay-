@@ -17,15 +17,26 @@ CFLAGS = -O3 -g -ffunction-sections -fdata-sections -funroll-loops -finline-func
          -Wno-unused-variable \
          -Wno-sign-compare \
          -Wno-missing-field-initializers \
-         -Wno-aggressive-loop-optimizations \
-         -Wno-stringop-overflow
+         -Wno-aggressive-loop-optimizations
 # Keep symbols (-g above, no strip) and export them (-rdynamic) so the built-in
-# crash handler prints a readable backtrace. For a smaller release binary, strip
-# with:  strip aplay+    (or re-add -Wl,-s to LDFLAGS).
+# crash handler prints a readable backtrace. `make release` builds a stripped
+# copy for distribution and keeps this one as the debug artifact.
 LDFLAGS = -lasound -lm -rdynamic -Wl,--gc-sections
 
 .PHONY: all
 all: $(PROGRAM)
+
+# Release build: keep the unstripped binary as a debug artifact (for addr2line
+# against crash-handler backtraces) and ship the stripped copy (~77% smaller).
+.PHONY: release
+release: aplay+
+	cp aplay+ aplay+.debug
+	strip aplay+
+	@ls -l aplay+ aplay+.debug
+
+.PHONY: test
+test:
+	bash tests/run_tests.sh
 
 $(PROGRAM): % : %.o
 	$(CC) $< -o $@ $(LDFLAGS)

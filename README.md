@@ -223,6 +223,8 @@ Each track shows what's playing and, for FLAC, its embedded metadata:
   `dr_mp3` can only get an accurate length by decoding the whole file, which is
   too expensive to do up front just for a display value. AAC/WMA/DSD likewise
   show tags + codec/rate but no duration.
+- During playback a progress line shows **elapsed / total time** (elapsed only
+  where the total is unknown: MP3, AAC, WMA), updated once per second.
 
 ### Playlists
 
@@ -246,12 +248,13 @@ reaches your DAC, with the negotiated output format appended (e.g.
 | Indicator (color) | What happens to the samples | Audiophile verdict |
 |---|---|---|
 | `● BIT PERFECT` (green) | `hw:` device at the source's native rate; sample values sent untouched (24-bit in an S32 container is still bit-identical) | Pristine |
-| `◆ MODIFIED · volume/crosstalk` (yellow) | Native-rate `hw:` path, but `-V` software volume and/or `-c` crosstalk altered the samples | Intentional DSP — not bit-perfect |
+| `◆ MODIFIED · crosstalk` (yellow) | Native-rate `hw:` path, but `-c` crosstalk cancellation altered the samples | Intentional DSP — not bit-perfect |
 | `◆ FORMAT-CONVERTED` (yellow) | `plughw` converted only the sample *format* (rate unchanged) | Benign |
 | `▲ RESAMPLED · 96 → 48 kHz` (amber) | The device couldn't do the source rate, so ALSA's plug layer resampled it | Audible change — the one to avoid |
 
 To stay in the green, pick a device that natively supports your files' rates
-(`aplay+ -L` shows each device's supported rates), and leave `-V`/`-c` off.
+(`aplay+ -L` shows each device's supported rates), and leave `-c` off.
+There is deliberately no software volume: volume is your DAC/amp's job.
 
 ---
 
@@ -394,7 +397,6 @@ Options:
   -s <regexp>         Only play files whose path matches this regex
   -t <ext>            Only play files of this type (e.g. flac, mp3, wav)
   -v                  Verbose output (decoder frame info, etc.)
-  -V <volume>         Software volume, 0.0–1.0 (default: 1.0)
   -P                  Force DSD→PCM conversion (default: native DSD if supported)
   -c                  Enable crosstalk cancellation (XTC)
   -D <metres>         Speaker distance for XTC delay calculation (default: 0.5)
@@ -492,16 +494,6 @@ Only play files with this extension (case-insensitive exact match).
 
 Print decoder frame information during playback.
 
-### `-V <volume>` — Software Volume
-
-Scale output volume in software. Range is `0.0` (silent) to `1.0` (full,
-default). Applied before writing to ALSA so there is no interaction with the
-hardware mixer.
-
-```bash
-./aplay+ -V 0.7 /path/to/music/
-```
-
 ### `-P` — Force DSD→PCM Conversion
 
 By default, `.dsf` files play via native DSD passthrough when the DAC supports
@@ -561,7 +553,7 @@ each track as it starts. The full set of keys that work during playback:
 | Key | Action |
 |-----|--------|
 | `q` or `Esc` | Stop and exit |
-| `Space` | Pause / resume |
+| `Space` | Pause / resume (hardware pause where the DAC supports it; emulated elsewhere — resume may skip the few buffered milliseconds) |
 | `n` | Skip to next track |
 | `p` or `b` | Go back to previous track |
 | `c` | Toggle crosstalk cancellation |
@@ -591,8 +583,8 @@ each track as it starts. The full set of keys that work during playback:
 # Play with crosstalk cancellation at 80cm speaker spacing
 ./aplay+ -c -D 0.8 -d hw:1,0 /Music/
 
-# Loop an album at reduced volume
-./aplay+ -l -V 0.8 -d hw:1,0 "/Music/Artist/Album/"
+# Loop an album
+./aplay+ -l -d hw:1,0 "/Music/Artist/Album/"
 
 # Play DSD natively (DAC's DSD light should come on)
 ./aplay+ -d hw:3,0 "/Music/Album (DSD128)/01. Track.dsf"

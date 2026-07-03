@@ -5,6 +5,11 @@
  * Basic usage:
  *	int num;
  *	LS_LIST *ls = ls_dir("dir/", LS_RECURSIVE|LS_RANDOM, &num);
+ *
+ * ls_dir returns FILES only (full paths), exactly `*num` of them, natural-order
+ * sorted (or shuffled with LS_RANDOM). Directories are descended into with
+ * LS_RECURSIVE but never appear as entries. Returns NULL with *num==0 when
+ * there is nothing to list.
  * */
 
 #include <stdio.h>
@@ -18,113 +23,57 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
-#define RANDOM_DEVICE "/dev/urandom"
-int urandom;
-void urandom_init()
-{
-	urandom = open(RANDOM_DEVICE, O_RDONLY);
-	if (urandom<0) {
-		fprintf(stderr, "Failed to open %s\n", RANDOM_DEVICE);
-		exit(EXIT_FAILURE);
-	}
-}
-uint32_t urandom_number()
-{
-	uint32_t c;
-	read(urandom, &c, sizeof(c));
-	return c;
-}
-void urandom_end()
-{
-	close(urandom);
-}
-
 #define LS_RECURSIVE	1
 #define LS_RANDOM	2
 
 typedef struct {
-	int count, dir;
 	char d_name[PATH_MAX];
 } LS_LIST;
 
-int ls_count_dir(char *dir, int flag)
+// Append all regular files under `dir` (descending into subdirs when
+// LS_RECURSIVE) to the growing array. Single pass, no chdir. Returns 0 on
+// success, -1 if `dir` could not be opened or memory ran out.
+static int ls_collect(const char *dir, int flag, LS_LIST **arr, int *n, int *cap)
 {
-	DIR *dp;
+	DIR *dp = opendir(dir);
+	if (!dp) return -1;
+
 	struct dirent *entry;
-	struct stat statbuf;
-
-	if (!(dp = opendir(dir))) {
-		perror("opendir");
-		printf("%s\n", dir);
-		return 0;
-	}
-	char *cpath = getcwd(0, 0);
-	chdir(dir);
-
-	int i=0;
 	while ((entry = readdir(dp))) {
 		if (!strcmp(".", entry->d_name) || !strcmp("..", entry->d_name)) continue;
 
-		if (flag & LS_RECURSIVE) {
-			stat(entry->d_name, &statbuf);
-			if (S_ISDIR(statbuf.st_mode)) {
-				char path[PATH_MAX];
-				sprintf(path, "%s/%s", dir, entry->d_name);
-				i += ls_count_dir(path, flag);
-				continue; // dir (no count)
-			}
-		}
+		char path[PATH_MAX];
+		if (snprintf(path, sizeof(path), "%s/%s", dir, entry->d_name)
+		    >= (int)sizeof(path)) continue;	// path too long — skip
 
-		i++;
-	}
-
-	closedir(dp);
-	chdir(cpath);
-	free(cpath);
-
-	return i;
-}
-	
-int ls_seek_dir(char *dir, LS_LIST *ls, int flag, int n)
-{
-	DIR *dp;
-	struct dirent *entry;
-	struct stat statbuf;
-	char buf[PATH_MAX];
-
-	if (!(dp = opendir(dir))) {
-		perror("opendir");
-		printf("%s\n", dir);
-		return 0;
-	}
-	char *cpath = getcwd(0, 0);
-	chdir(dir);
-
-	int i=0;
-	while ((entry = readdir(dp))) {
-		if (!strcmp(".", entry->d_name) || !strcmp("..", entry->d_name)) continue;
-
-		sprintf(buf, "%s/%s", dir, entry->d_name);
-		strcpy((ls+i)->d_name, buf);
-
-		stat(entry->d_name, &statbuf);
-		if (S_ISDIR(statbuf.st_mode)) { // dir (no count)
-			(ls+i)->count = 0; // dir
-			(ls+i)->dir = ++n;
-
-			if (flag & LS_RECURSIVE) i += ls_seek_dir(buf, ls+i, flag, n);
+		// Prefer d_type to avoid a stat per entry; fall back where unsupported.
+		int isdir;
+		if (entry->d_type != DT_UNKNOWN && entry->d_type != DT_LNK) {
+			isdir = (entry->d_type == DT_DIR);
 		} else {
-			i++;
-			(ls+i)->count = i; // count in dir
-			(ls+i)->dir = n;
+			struct stat st;
+			if (stat(path, &st) != 0) continue;
+			isdir = S_ISDIR(st.st_mode);
 		}
+
+		if (isdir) {
+			if (flag & LS_RECURSIVE) ls_collect(path, flag, arr, n, cap);
+			continue;	// directories are never entries
+		}
+
+		if (*n == *cap) {
+			int ncap = *cap ? *cap * 2 : 64;
+			LS_LIST *na = (LS_LIST*)realloc(*arr, ncap * sizeof(LS_LIST));
+			if (!na) { closedir(dp); return -1; }
+			*arr = na;
+			*cap = ncap;
+		}
+		snprintf((*arr)[*n].d_name, PATH_MAX, "%s", path);
+		(*n)++;
 	}
 
 	closedir(dp);
-	chdir(cpath);
-	free(cpath);
-
-	return i;
+	return 0;
 }
 
 // Natural-order, case-insensitive compare: runs of digits compare by numeric
@@ -159,71 +108,65 @@ int ls_natcmp(const char *a, const char *b)
 
 int ls_comp_func(const void *a, const void *b)
 {
-	return ls_natcmp((char*)(((LS_LIST*)a)->d_name), (char*)(((LS_LIST*)b)->d_name));
+	return ls_natcmp(((const LS_LIST*)a)->d_name, ((const LS_LIST*)b)->d_name);
+}
+
+// Fisher-Yates shuffle using /dev/urandom, falling back to rand().
+static void ls_shuffle(LS_LIST *ls, int n)
+{
+	int fd = open("/dev/urandom", O_RDONLY);
+	if (fd < 0) srand(time(NULL));
+	for (int i = n - 1; i > 0; i--) {
+		uint32_t r;
+		if (fd < 0 || read(fd, &r, sizeof(r)) != sizeof(r)) r = (uint32_t)rand();
+		int a = r % (i + 1);
+		LS_LIST tmp = ls[i];
+		ls[i] = ls[a];
+		ls[a] = tmp;
+	}
+	if (fd >= 0) close(fd);
 }
 
 LS_LIST *ls_dir(char *_dir, int flag, int *num)
 {
-	char dir[PATH_MAX+1];
-	realpath(_dir, dir);
-
 	*num = 0;	// always define the out-param, even on the early returns below
 
-	int n = ls_count_dir(dir, flag)+1; // FIXME: +1 ??
-	if (!n) {
-		fprintf(stderr, "No file found in %s\n", dir);
-		return 0;
+	char dir[PATH_MAX];
+	if (!realpath(_dir, dir)) snprintf(dir, sizeof(dir), "%s", _dir);
+
+	int n = 0, cap = 0;
+	LS_LIST *ls = NULL;
+	if (ls_collect(dir, flag, &ls, &n, &cap) != 0 && n == 0) {
+		fprintf(stderr, "cannot list %s\n", dir);
+		free(ls);
+		return NULL;
+	}
+	if (n == 0) {	// opened fine but nothing to play (empty / only subdirs)
+		free(ls);
+		return NULL;
 	}
 
-	LS_LIST *ls = (LS_LIST *)calloc(n, sizeof(LS_LIST));
-	if (!ls) {
-		perror("calloc");
-		return 0;
-	}
-
-	// ls_seek_dir returns the file count; 0 is valid (e.g. a dir of only
-	// subdirs), not an error. Keep the (possibly empty) array so callers can
-	// iterate it safely instead of getting a NULL with an unset count.
-	ls_seek_dir(dir, ls, flag, 0);
-
-	if (flag & LS_RANDOM) {
-#ifdef RANDOM_H
-		urandom_init();
-#else
-		srand(time(NULL));
-#endif
-		for (int i=n-1; i>0; i--) { // Fisher-Yates shuffle
-#ifdef RANDOM_H
-			uint32_t r = urandom_number();
-			int a = r % (i + 1); // Ensure a is in range [0, i]
-#else
-			int a = (rand() / RAND_MAX)*n;
-#endif
-			LS_LIST b = ls[i];
-			ls[i] = ls[a];
-			ls[a] = b;
-		}
-#ifdef RANDOM_H
-		urandom_end();
-#endif
-	} else {
-		qsort(ls, n, sizeof(LS_LIST), ls_comp_func);
-	}
+	if (flag & LS_RANDOM) ls_shuffle(ls, n);
+	else                  qsort(ls, n, sizeof(LS_LIST), ls_comp_func);
 
 	*num = n;
 	return ls;
 }
 
 #include <ctype.h>
+// Lowercased extension of the basename of `path` ("" when there is no dot).
+// Returns a static buffer; extensions longer than 9 chars are truncated.
 char *findExt(char *path)
 {
 	static char ext[10];
-	char *e = &ext[9];
-	*e-- = 0;
-	int len = strlen(path)-1;
-	for (int i=len; i>=0 && i>len-9; i--) {	// i>=0: never read before the string
-		if (path[i] == '.' ) break;
-		*e-- = tolower(path[i]);
-	}
-	return e+1;
+	ext[0] = 0;
+	const char *base = strrchr(path, '/');
+	base = base ? base + 1 : path;
+	const char *dot = strrchr(base, '.');
+	if (!dot || !dot[1]) return ext;
+	size_t i;
+	for (i = 0; i < sizeof(ext) - 1 && dot[1 + i]; i++)
+		ext[i] = (char)tolower((unsigned char)dot[1 + i]);
+	ext[i] = 0;
+	return ext;
 }

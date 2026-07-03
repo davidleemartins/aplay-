@@ -34,7 +34,6 @@ Theme theme = {
 // App-side DSP state, declared before alsa.h so AUDIO_init_auto's playback-status
 // indicator can tell whether the output is still bit-perfect. (Note: AUDIO_init*'s
 // own `flag` param is the stream direction, not these app flags.)
-float volume = 1.0f;
 int crosstalk = 0;	// set when -c is given
 int g_interrupt = 0;	// set when a keypress stops the current track, so AUDIO_close
 			// drops the buffered audio (instant) instead of draining it
@@ -43,16 +42,14 @@ int g_interrupt = 0;	// set when a keypress stops the current track, so AUDIO_cl
 #define USE_TEST_MODE 512 // Flag for test mode
 
 #include "alsa.h"
+#include "dsp.h"	// crosstalk cancellation (needs SND_PCM_FORMAT_* from alsa.h)
+#include "tags.h"	// ID3v2 / MP4 / ASF tag parsers + Tags + fmt_duration
 #define DR_FLAC_IMPLEMENTATION
 #include "dr_flac.h"
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
 #define DR_MP3_IMPLEMENTATION
-#ifdef DR_MP3_IMPLEMENTATION
 #include "dr_mp3.h"
-#else
-#include "minimp3.h"
-#endif
 #define HELIX_FEATURE_AUDIO_CODEC_AAC_SBR
 #include "uaac.h"
 #include "uwma.h"
@@ -84,13 +81,17 @@ int key(AUDIO *a)
 		printf("%x\n", c);
 	}
 	if (c==0x20) {
-		snd_pcm_pause(a->handle, 1);
+		// Pause. Many USB DACs don't support hardware pause — emulate it there
+		// by dropping the buffered audio and re-preparing on resume (loses the
+		// small buffered tail, but pause works on every device).
+		if (a->can_pause) snd_pcm_pause(a->handle, 1);
+		else              snd_pcm_drop(a->handle);
 		do {
 			usleep(1000); // us
 		} while (!kbhit());
 		getchar(); // clear
 		cmd = 0;
-		snd_pcm_pause(a->handle, 0);
+		if (a->can_pause) snd_pcm_pause(a->handle, 0);
 		snd_pcm_prepare(a->handle);
 		return 0;
 	}
@@ -105,105 +106,6 @@ int key(AUDIO *a)
 char *dev = "hw:0,0";  // BitPerfect
 
 #define FRAMES        32
-#define MAX_DELAY_SAMPLES 16 // Maximum delay samples for crosstalk (e.g., 71µs at 44.1kHz is ~3 samples)
-
-// Crosstalk cancellation parameters
-typedef struct {
-	int delay_samples;    // Delay in samples (e.g., 3 for 71µs at 44.1kHz)
-	float attenuation;    // Attenuation factor (e.g., 0.9)
-	float *delay_buffer;  // Buffer to store delayed samples
-	int delay_buffer_size; // Size of delay buffer
-	int delay_index;      // Current index in delay buffer
-} CrosstalkCancel;
-
-void init_crosstalk_cancellation(CrosstalkCancel *xtc, int sample_rate, int channels)
-{
-	// Always clear delay_buffer first: callers keep `xtc` on the stack
-	// (uninitialized), and free_crosstalk_cancellation() will free(delay_buffer).
-	// Without this, a non-stereo file would free() a garbage pointer and crash.
-	xtc->delay_buffer = NULL;
-	if (channels != 2) {
-		return;
-	}
-	// 音速343m/sを基準に、スピーカー間距離から遅延を計算
-	xtc->delay_samples = (int)(sample_rate * (speaker_distance_m / 343.0));
-	xtc->attenuation = 0.4f; // デフォルト値
-	xtc->delay_buffer_size = xtc->delay_samples * 2;
-	if (xtc->delay_buffer_size < 2) {
-		xtc->delay_buffer_size = 2;
-	}
-	xtc->delay_buffer = (float*)calloc(xtc->delay_buffer_size, sizeof(float));
-	xtc->delay_index = 0;
-}
-
-void free_crosstalk_cancellation(CrosstalkCancel *xtc)
-{
-	if (xtc->delay_buffer) {
-		free(xtc->delay_buffer);
-		xtc->delay_buffer = NULL;
-	}
-}
-
-void apply_crosstalk_cancellation(CrosstalkCancel *xtc, void *buffer, int frames, int channels, int format)
-{
-	if (channels != 2) {
-		return;        // Only support stereo
-	}
-
-	if (format == SND_PCM_FORMAT_FLOAT_LE) {
-		float *data = (float*)buffer;
-		float temp[frames * 2];
-		memcpy(temp, data, frames * 2 * sizeof(float));
-
-		// Process crosstalk cancellation
-		for (int i = 0; i < frames; i++) {
-			int idx = i * 2;
-			int delay_idx = (xtc->delay_index - xtc->delay_samples * 2 + xtc->delay_buffer_size) % xtc->delay_buffer_size;
-
-			// Store current samples in delay buffer
-			xtc->delay_buffer[xtc->delay_index] = temp[idx];     // Left
-			xtc->delay_buffer[xtc->delay_index + 1] = temp[idx + 1]; // Right
-			xtc->delay_index = (xtc->delay_index + 2) % xtc->delay_buffer_size;
-
-			// Apply crosstalk cancellation
-			float delayed_left = xtc->delay_buffer[delay_idx];
-			float delayed_right = xtc->delay_buffer[delay_idx + 1];
-
-			float new_left  = (temp[idx]     - xtc->attenuation * delayed_right) * volume;
-			float new_right = (temp[idx + 1] - xtc->attenuation * delayed_left)  * volume;
-
-			// Clamp after volume so we don't clip a pre-volume peak
-			data[idx]     = fmaxf(fminf(new_left,  1.0f), -1.0f);
-			data[idx + 1] = fmaxf(fminf(new_right, 1.0f), -1.0f);
-		}
-	} else { // SND_PCM_FORMAT_S16_LE
-		int16_t *data = (int16_t*)buffer;
-		float temp[frames * 2];
-		for (int i = 0; i < frames * 2; i++) {
-			temp[i] = data[i] / 32768.0f;
-		}
-
-		for (int i = 0; i < frames; i++) {
-			int idx = i * 2;
-			int delay_idx = (xtc->delay_index - xtc->delay_samples * 2 + xtc->delay_buffer_size) % xtc->delay_buffer_size;
-
-			xtc->delay_buffer[xtc->delay_index] = temp[idx];
-			xtc->delay_buffer[xtc->delay_index + 1] = temp[idx + 1];
-			xtc->delay_index = (xtc->delay_index + 2) % xtc->delay_buffer_size;
-
-			float delayed_left = xtc->delay_buffer[delay_idx];
-			float delayed_right = xtc->delay_buffer[delay_idx + 1];
-
-			temp[idx] = (temp[idx] - xtc->attenuation * delayed_right) * volume;
-			temp[idx + 1] = (temp[idx + 1] - xtc->attenuation * delayed_left) * volume;
-		}
-
-		for (int i = 0; i < frames * 2; i++) {
-			float val = temp[i] * 32767.0f;
-			data[i] = (int16_t)fmaxf(fminf(val, 32767.0f), -32768.0f);
-		}
-	}
-}
 
 void print_test_mode_status(int phase, int flag, CrosstalkCancel *xtc)
 {
@@ -227,18 +129,7 @@ void print_test_mode_status(int phase, int flag, CrosstalkCancel *xtc)
 	fflush(stdout);
 }
 
-// ---- now-playing metadata block ----
-typedef struct { char artist[160], album[160], title[160]; } Tags;
-
-static void fmt_duration(char *out, size_t n, double sec)
-{
-	if (sec <= 0) { snprintf(out, n, "--:--"); return; }
-	int s = (int)(sec + 0.5);
-	int h = s / 3600, m = (s % 3600) / 60, ss = s % 60;
-	if (h) snprintf(out, n, "%d:%02d:%02d", h, m, ss);
-	else   snprintf(out, n, "%d:%02d", m, ss);
-}
-
+// ---- now-playing metadata block (Tags/parsers/fmt_duration live in tags.h) ----
 // Print just the tag lines (title, then "artist — album"), when present.
 static void print_tags(const Tags *t)
 {
@@ -276,228 +167,6 @@ static void print_now_playing(const char *codec, const Tags *t,
 	printf("\e[0m\n");
 }
 
-// Fill artist/album/title from a "KEY=VALUE" comment (FLAC/Ogg Vorbis comments).
-static void tag_set_kv(Tags *t, const char *kv)
-{
-	const char *eq = strchr(kv, '=');
-	if (!eq) return;
-	int klen = (int)(eq - kv);
-	const char *val = eq + 1;
-	if (klen == 6 && !strncasecmp(kv, "ARTIST", 6)) snprintf(t->artist, sizeof t->artist, "%s", val);
-	else if (klen == 5 && !strncasecmp(kv, "ALBUM", 5)) snprintf(t->album, sizeof t->album, "%s", val);
-	else if (klen == 5 && !strncasecmp(kv, "TITLE", 5)) snprintf(t->title, sizeof t->title, "%s", val);
-}
-
-// Decode an ID3v2 text frame payload into dst (handles Latin1/UTF-8 directly,
-// and UTF-16 as its ASCII subset — enough for a readable now-playing line).
-static void id3_text(char *dst, size_t dn, unsigned char enc, const unsigned char *s, long n)
-{
-	size_t o = 0;
-	if (enc == 1 || enc == 2) {	// UTF-16 (with/without BOM) / UTF-16BE
-		long i = 0; int be = (enc == 2);
-		if (enc == 1 && n >= 2) {
-			if (s[0] == 0xFF && s[1] == 0xFE) { be = 0; i = 2; }
-			else if (s[0] == 0xFE && s[1] == 0xFF) { be = 1; i = 2; }
-		}
-		for (; i + 1 < n && o < dn - 1; i += 2) {
-			unsigned char hi = be ? s[i] : s[i + 1];
-			unsigned char lo = be ? s[i + 1] : s[i];
-			if (hi == 0 && lo >= 0x20) dst[o++] = (char)lo;
-		}
-	} else {			// Latin1 (0) or UTF-8 (3)
-		for (long i = 0; i < n && o < dn - 1; i++) {
-			if (s[i] == 0) break;
-			dst[o++] = (char)s[i];
-		}
-	}
-	dst[o] = 0;
-}
-
-// Minimal ID3v2.3/2.4 tag reader from the current file position: pulls
-// TIT2/TPE1/TALB (title/artist/album). Used for MP3 (offset 0) and DSF (the
-// header points to an ID3 chunk elsewhere in the file).
-static void read_id3v2_fp(FILE *fp, Tags *t)
-{
-	unsigned char h[10];
-	if (fread(h, 1, 10, fp) != 10 || memcmp(h, "ID3", 3) != 0) return;
-	int major = h[3];
-	long size = ((long)(h[6] & 0x7f) << 21) | ((h[7] & 0x7f) << 14) |
-	            ((h[8] & 0x7f) << 7) | (h[9] & 0x7f);	// syncsafe
-	if (size <= 0 || size > 10 * 1024 * 1024) return;
-	unsigned char *buf = malloc(size);
-	if (!buf) return;
-	long got = (long)fread(buf, 1, size, fp);
-
-	long pos = 0;
-	while (pos + 10 <= got) {
-		char id[5]; memcpy(id, buf + pos, 4); id[4] = 0;
-		unsigned long fsize = (major == 4)
-		    ? (((unsigned long)(buf[pos+4]&0x7f)<<21)|((buf[pos+5]&0x7f)<<14)|((buf[pos+6]&0x7f)<<7)|(buf[pos+7]&0x7f))
-		    : (((unsigned long)buf[pos+4]<<24)|((unsigned long)buf[pos+5]<<16)|((unsigned long)buf[pos+6]<<8)|buf[pos+7]);
-		pos += 10;
-		if (id[0] == 0) break;	// padding
-		if (fsize == 0 || pos + (long)fsize > got) break;
-
-		char *dst = !strcmp(id, "TIT2") ? t->title
-		          : !strcmp(id, "TPE1") ? t->artist
-		          : !strcmp(id, "TALB") ? t->album : NULL;
-		if (dst) id3_text(dst, 160, buf[pos], buf + pos + 1, (long)fsize - 1);
-		pos += fsize;
-	}
-	free(buf);
-}
-
-// MP3: ID3v2 tag is at the start of the file.
-static void read_id3v2(const char *path, Tags *t)
-{
-	FILE *fp = fopen(path, "rb");
-	if (!fp) return;
-	read_id3v2_fp(fp, t);
-	fclose(fp);
-}
-
-// DSF: the "DSD " header chunk holds a 64-bit LE pointer (at offset 20) to an
-// embedded ID3v2 metadata chunk; read tags from there if present.
-static void read_dsf_tags(const char *path, Tags *t)
-{
-	FILE *fp = fopen(path, "rb");
-	if (!fp) return;
-	unsigned char hdr[28];
-	if (fread(hdr, 1, 28, fp) == 28 && memcmp(hdr, "DSD ", 4) == 0) {
-		unsigned long long ptr = 0;
-		for (int i = 0; i < 8; i++) ptr |= (unsigned long long)hdr[20 + i] << (8 * i);
-		if (ptr != 0 && fseek(fp, (long)ptr, SEEK_SET) == 0)
-			read_id3v2_fp(fp, t);
-	}
-	fclose(fp);
-}
-
-// Find a direct child MP4/ISO atom of `type` within [pos,end). On success sets
-// the child's content range [*c0,*c1) and returns 1.
-static int mp4_child(FILE *fp, long pos, long end, const char *type, long *c0, long *c1)
-{
-	while (pos + 8 <= end) {
-		unsigned char hdr[8];
-		if (fseek(fp, pos, SEEK_SET) != 0 || fread(hdr, 1, 8, fp) != 8) return 0;
-		unsigned long long sz = ((unsigned long)hdr[0] << 24) | ((unsigned long)hdr[1] << 16) |
-		                        ((unsigned long)hdr[2] << 8) | hdr[3];
-		long hdrlen = 8;
-		if (sz == 1) {	// 64-bit extended size
-			unsigned char ext[8];
-			if (fread(ext, 1, 8, fp) != 8) return 0;
-			sz = 0; for (int i = 0; i < 8; i++) sz = (sz << 8) | ext[i];
-			hdrlen = 16;
-		}
-		if (sz < (unsigned long long)hdrlen) return 0;
-		long next = pos + (long)sz;
-		if (next <= pos || next > end) break;
-		if (memcmp(hdr + 4, type, 4) == 0) { *c0 = pos + hdrlen; *c1 = next; return 1; }
-		pos = next;
-	}
-	return 0;
-}
-
-// MP4/m4a tags: moov/udta/meta/ilst/{©nam,©ART,©alb}/data → UTF-8 text.
-static void read_mp4_tags(const char *path, Tags *t)
-{
-	FILE *fp = fopen(path, "rb");
-	if (!fp) return;
-	fseek(fp, 0, SEEK_END);
-	long fend = ftell(fp);
-
-	long m0, m1, u0, u1, e0, e1, i0, i1;
-	if (mp4_child(fp, 0, fend, "moov", &m0, &m1) &&
-	    mp4_child(fp, m0, m1, "udta", &u0, &u1) &&
-	    mp4_child(fp, u0, u1, "meta", &e0, &e1) &&
-	    // `meta` is a full atom (4-byte version/flags before children); fall back
-	    // to no-prefix layout if the +4 form doesn't contain ilst.
-	    (mp4_child(fp, e0 + 4, e1, "ilst", &i0, &i1) ||
-	     mp4_child(fp, e0, e1, "ilst", &i0, &i1))) {
-		struct { const char *type; char *dst; } map[] = {
-			{ "\251nam", t->title }, { "\251ART", t->artist }, { "\251alb", t->album },
-		};
-		for (int k = 0; k < 3; k++) {
-			long a0, a1, d0, d1;
-			if (mp4_child(fp, i0, i1, map[k].type, &a0, &a1) &&
-			    mp4_child(fp, a0, a1, "data", &d0, &d1)) {
-				long vstart = d0 + 8;	// data atom: 4 version/flags + 4 reserved, then value
-				long vlen = d1 - vstart;
-				if (vlen > 0) {
-					if (vlen > 159) vlen = 159;
-					fseek(fp, vstart, SEEK_SET);
-					size_t got = fread(map[k].dst, 1, (size_t)vlen, fp);
-					map[k].dst[got] = 0;
-				}
-			}
-		}
-	}
-	fclose(fp);
-}
-
-// WMA/ASF tags: Title+Author from the Content Description Object, Album from the
-// Extended Content Description Object (WM/AlbumTitle). Strings are UTF-16LE.
-static void read_asf_tags(const char *path, Tags *t)
-{
-	static const unsigned char G_HDR[16] = {0x30,0x26,0xB2,0x75,0x8E,0x66,0xCF,0x11,0xA6,0xD9,0x00,0xAA,0x00,0x62,0xCE,0x6C};
-	static const unsigned char G_CDO[16] = {0x33,0x26,0xB2,0x75,0x8E,0x66,0xCF,0x11,0xA6,0xD9,0x00,0xAA,0x00,0x62,0xCE,0x6C};
-	static const unsigned char G_ECD[16] = {0x40,0xA4,0xD0,0xD2,0x07,0xE3,0xD2,0x11,0x97,0xF0,0x00,0xA0,0xC9,0x5E,0xA8,0x50};
-#define LE16(p) ((unsigned)((p)[0] | ((p)[1] << 8)))
-
-	FILE *fp = fopen(path, "rb");
-	if (!fp) return;
-	unsigned char head[30];
-	if (fread(head, 1, 30, fp) != 30 || memcmp(head, G_HDR, 16) != 0) { fclose(fp); return; }
-	unsigned long long hsize = 0;
-	for (int i = 0; i < 8; i++) hsize |= (unsigned long long)head[16 + i] << (8 * i);
-	if (hsize < 30 || hsize > 4 * 1024 * 1024) { fclose(fp); return; }
-
-	unsigned char *buf = malloc(hsize);
-	if (!buf) { fclose(fp); return; }
-	fseek(fp, 0, SEEK_SET);
-	unsigned long long got = fread(buf, 1, hsize, fp);
-	fclose(fp);
-
-	unsigned long long pos = 30;
-	while (pos + 24 <= got) {
-		unsigned long long osize = 0;
-		for (int i = 0; i < 8; i++) osize |= (unsigned long long)buf[pos + 16 + i] << (8 * i);
-		if (osize < 24 || pos + osize > got) break;
-
-		if (memcmp(buf + pos, G_CDO, 16) == 0) {
-			unsigned long long d = pos + 24;
-			if (d + 10 <= got) {
-				unsigned tl = LE16(buf + d), al = LE16(buf + d + 2);
-				unsigned long long p = d + 10;
-				if (p + tl <= got) id3_text(t->title, 160, 1, buf + p, tl);
-				p += tl;
-				if (p + al <= got) id3_text(t->artist, 160, 1, buf + p, al);
-			}
-		} else if (memcmp(buf + pos, G_ECD, 16) == 0) {
-			unsigned long long d = pos + 24;
-			if (d + 2 <= got) {
-				unsigned count = LE16(buf + d);
-				unsigned long long p = d + 2;
-				for (unsigned i = 0; i < count && p + 2 <= got; i++) {
-					unsigned nlen = LE16(buf + p); p += 2;
-					if (p + nlen + 4 > got) break;
-					char nm[64];
-					id3_text(nm, sizeof nm, 1, buf + p, nlen);
-					p += nlen;
-					unsigned vtype = LE16(buf + p); p += 2;
-					unsigned vlen = LE16(buf + p); p += 2;
-					if (p + vlen > got) break;
-					if (vtype == 0 && !strcmp(nm, "WM/AlbumTitle"))
-						id3_text(t->album, 160, 1, buf + p, vlen);
-					p += vlen;
-				}
-			}
-		}
-		pos += osize;
-	}
-	free(buf);
-#undef LE16
-}
-
 void play_test_mode(int format, int flag)
 {
 	const int sample_rate = 44100; // Standard sample rate
@@ -521,7 +190,7 @@ void play_test_mode(int format, int flag)
 	}
 
 	CrosstalkCancel xtc;
-	init_crosstalk_cancellation(&xtc, sample_rate, channels);
+	init_crosstalk_cancellation(&xtc, sample_rate, channels, speaker_distance_m);
 
 	uint64_t global_sample_index = 0;
 	int phase_sample_index = 0;
@@ -609,82 +278,128 @@ void play_test_mode(int format, int flag)
 	free_crosstalk_cancellation(&xtc);
 }
 
-void display_progress(uint64_t current, uint64_t total, int is_time, const char *label)
+static long file_size(const char *path)
 {
-	if (total == 0) {
-		return;        // Skip if unknown
+	struct stat st;
+	return (stat(path, &st) == 0) ? (long)st.st_size : 0;
+}
+
+// ---- unified PCM playback driver ----------------------------------------
+// Every decoder is wrapped in a PCMSource; play_pcm() owns the shared loop:
+// format defaulting, ALSA negotiation, crosstalk at the NEGOTIATED format,
+// throttled progress, key handling and cleanup. Native-DSD passthrough and
+// test mode keep their own loops (no PCM conversion / no file).
+typedef struct PCMSource PCMSource;
+struct PCMSource {
+	// Decode the next chunk in `out_format`. `drvbuf` (capacity `drvframes`
+	// frames) may be filled, or the source may hand back its own buffer via
+	// *out (sources with natural framing: AAC, WMA, Ogg). Returns the number
+	// of frames decoded, 0 at end of stream or on error.
+	size_t (*read)(PCMSource *s, void *drvbuf, size_t drvframes, void **out);
+	void *ctx;             // decoder handle / per-format state
+	unsigned rate;         // source sample rate
+	int ch;                // channels
+	int src_bits;          // source bit depth (0 = unknown; >16 defaults to S32)
+	int out_format;        // set by the driver after ALSA negotiation
+	uint64_t total_frames; // 0 = unknown (progress shows elapsed time only)
+};
+
+// Returns 0 on success, 1 if the audio device could not be initialized.
+static int play_pcm(PCMSource *s, int format, int flag)
+{
+	// If the user didn't request a specific format (-f), pick the best match
+	// for the source bit depth. S16_LE for 16-bit, S32_LE for 20/24/32-bit.
+	// This matters for DACs whose USB endpoints only expose 24-bit at high
+	// sample rates — sending S16_LE to a 24-bit endpoint produces silence.
+	if (!format && s->src_bits > 16) {
+		format = SND_PCM_FORMAT_S32_LE;
 	}
-	if (is_time) {
-		int cur_sec = (int)(current % 60);
-		int cur_min = (int)(current / 60);
-		int tot_sec = (int)(total % 60);
-		int tot_min = (int)(total / 60);
-		printf("\r%s %02d:%02d / %02d:%02d", label, cur_min, cur_sec, tot_min, tot_sec);
-	} else {
-		printf("\r%s %llu / %llu bytes", label, (unsigned long long)current, (unsigned long long)total);
+
+	AUDIO a;
+	if (AUDIO_init_auto(&a, dev, s->rate, s->ch, FRAMES, 1, format)) {
+		return 1;
 	}
-	fflush(stdout);
+	s->out_format = a.actual_format;	// decode in what ALSA actually agreed to
+
+	CrosstalkCancel xtc;
+	init_crosstalk_cancellation(&xtc, s->rate, s->ch, speaker_distance_m);
+
+	printf("\e[?25l");
+	uint64_t done = 0;
+	unsigned last_sec = (unsigned)-1;
+	char tot[16] = "";
+	if (s->total_frames && s->rate)
+		fmt_duration(tot, sizeof tot, (double)s->total_frames / s->rate);
+
+	size_t n;
+	void *buf;
+	while ((n = s->read(s, a.buffer, a.frames, &buf)) > 0) {
+		if (flag & USE_CROSSTALK) {
+			apply_crosstalk_cancellation(&xtc, buf, n, s->ch, s->out_format);
+		}
+		AUDIO_play(&a, buf, n);
+
+		int k = key(&a);
+		if (k == 'c') {
+			flag ^= USE_CROSSTALK;
+		} else if (k) {
+			break;
+		}
+
+		// Progress, throttled to once per second of audio (not once per
+		// period — that was ~200 printfs/second).
+		done += n;
+		unsigned sec = s->rate ? (unsigned)(done / s->rate) : 0;
+		if (sec != last_sec) {
+			last_sec = sec;
+			char cur[16];
+			if (sec == 0) snprintf(cur, sizeof cur, "0:00");	// elapsed 0 is known, not "--:--"
+			else          fmt_duration(cur, sizeof cur, (double)sec);
+			if (tot[0]) printf("\r%s / %s\e[K", cur, tot);
+			else        printf("\r%s\e[K", cur);
+			fflush(stdout);
+		}
+	}
+	printf("\e[?25h");
+
+	AUDIO_close(&a);
+	free_crosstalk_cancellation(&xtc);
+	return 0;
+}
+
+// ---- WAV -----------------------------------------------------------------
+static size_t wav_read_cb(PCMSource *s, void *drvbuf, size_t drvframes, void **out)
+{
+	drwav *w = (drwav*)s->ctx;
+	*out = drvbuf;
+	switch (s->out_format) {
+	case SND_PCM_FORMAT_FLOAT_LE: return (size_t)drwav_read_pcm_frames_f32(w, drvframes, (float*)drvbuf);
+	case SND_PCM_FORMAT_S32_LE:   return (size_t)drwav_read_pcm_frames_s32(w, drvframes, (drwav_int32*)drvbuf);
+	default:                      return (size_t)drwav_read_pcm_frames_s16(w, drvframes, (drwav_int16*)drvbuf);
+	}
 }
 
 void play_wav(char *name, int format, int flag)
 {
 	drwav wav;
-	if (drwav_init_file(&wav, name, NULL)) {
-		Tags tags = {{0}};	// WAV rarely carries tags; show codec/rate/duration
-		struct stat ws;
-		long wsz = (stat(name, &ws) == 0) ? (long)ws.st_size : 0;
-		print_now_playing("WAV", &tags, wav.sampleRate, wav.bitsPerSample,
-		                  wav.channels, (unsigned long)wav.totalPCMFrameCount, wsz);
-
-		if (!format && wav.bitsPerSample > 16) {
-			format = SND_PCM_FORMAT_S32_LE;
-		}
-
-		AUDIO a;
-		if (AUDIO_init_auto(&a, dev, wav.sampleRate, wav.channels, FRAMES, 1, format)) {
-			return;
-		}
-
-		CrosstalkCancel xtc;
-		init_crosstalk_cancellation(&xtc, wav.sampleRate, wav.channels);
-
-		uint64_t (*func)(drwav* pWav, drwav_uint64 framesToRead, void* pBufferOut);
-		if (a.actual_format == SND_PCM_FORMAT_FLOAT_LE) {
-			func = (uint64_t (*)(drwav *, drwav_uint64, void *))drwav_read_pcm_frames_f32;
-		} else if (a.actual_format == SND_PCM_FORMAT_S32_LE) {
-			func = (uint64_t (*)(drwav *, drwav_uint64, void *))drwav_read_pcm_frames_s32;
-		} else {
-			func = (uint64_t (*)(drwav *, drwav_uint64, void *))drwav_read_pcm_frames_s16;
-		}
-
-		int c = 0;
-		printf("\e[?25l");
-		size_t n; // numberOfSamplesActuallyDecoded
-		while ((n = func(&wav, a.frames, (drwav_int16*)a.buffer)) > 0) {
-			if (n!=a.frames) {
-				printf("!");
-			}
-			if (flag & USE_CROSSTALK) {
-				apply_crosstalk_cancellation(&xtc, a.buffer, n, wav.channels, format);
-			}
-			AUDIO_play(&a, a.buffer, n);
-			int k = key(&a);
-			if (k=='c') {
-				flag ^= USE_CROSSTALK;
-			} else if (k) {
-				break;
-			}
-
-			printf("\r%d/%llu", c, wav.totalPCMFrameCount);
-			c += n;
-		}
-
-		AUDIO_close(&a);
-		drwav_uninit(&wav);
-		free_crosstalk_cancellation(&xtc);
+	if (!drwav_init_file(&wav, name, NULL)) {
+		fprintf(stderr, "Failed to open WAV: %s\n", name);
+		return;
 	}
+	Tags tags = {{0}};	// WAV rarely carries tags; show codec/rate/duration
+	print_now_playing("WAV", &tags, wav.sampleRate, wav.bitsPerSample,
+	                  wav.channels, (unsigned long)wav.totalPCMFrameCount, file_size(name));
+
+	PCMSource s = {
+		.read = wav_read_cb, .ctx = &wav,
+		.rate = wav.sampleRate, .ch = wav.channels, .src_bits = wav.bitsPerSample,
+		.total_frames = wav.totalPCMFrameCount,
+	};
+	play_pcm(&s, format, flag);
+	drwav_uninit(&wav);
 }
 
+// ---- FLAC ----------------------------------------------------------------
 // Pull ARTIST/ALBUM/TITLE out of a FLAC's Vorbis comment block.
 static void flac_tag_cb(void *pUser, drflac_metadata *pMeta)
 {
@@ -705,6 +420,17 @@ static void flac_tag_cb(void *pUser, drflac_metadata *pMeta)
 	}
 }
 
+static size_t flac_read_cb(PCMSource *s, void *drvbuf, size_t drvframes, void **out)
+{
+	drflac *f = (drflac*)s->ctx;
+	*out = drvbuf;
+	switch (s->out_format) {
+	case SND_PCM_FORMAT_FLOAT_LE: return (size_t)drflac_read_pcm_frames_f32(f, drvframes, (float*)drvbuf);
+	case SND_PCM_FORMAT_S32_LE:   return (size_t)drflac_read_pcm_frames_s32(f, drvframes, (drflac_int32*)drvbuf);
+	default:                      return (size_t)drflac_read_pcm_frames_s16(f, drvframes, (drflac_int16*)drvbuf);
+	}
+}
+
 void play_flac(char *name, int format, int flag)
 {
 	Tags tags = {{0}};
@@ -713,63 +439,314 @@ void play_flac(char *name, int format, int flag)
 		fprintf(stderr, "Failed to open FLAC: %s\n", name);
 		return;
 	}
-	struct stat fst;
-	long fsize = (stat(name, &fst) == 0) ? (long)fst.st_size : 0;
 	print_now_playing("FLAC", &tags, flac->sampleRate, flac->bitsPerSample,
-	                  flac->channels, (unsigned long)flac->totalPCMFrameCount, fsize);
+	                  flac->channels, (unsigned long)flac->totalPCMFrameCount, file_size(name));
 
-	// If the user didn't request a specific format (-f), pick the best match
-	// for the source bit depth. S16_LE for 16-bit, S32_LE for 20/24/32-bit.
-	// This matters for DACs whose USB endpoints only expose 24-bit at high
-	// sample rates — sending S16_LE to a 24-bit endpoint produces silence.
-	if (!format && flac->bitsPerSample > 16) {
-		format = SND_PCM_FORMAT_S32_LE;
+	PCMSource s = {
+		.read = flac_read_cb, .ctx = flac,
+		.rate = flac->sampleRate, .ch = flac->channels, .src_bits = flac->bitsPerSample,
+		.total_frames = flac->totalPCMFrameCount,
+	};
+	play_pcm(&s, format, flag);
+	drflac_close(flac);
+}
+
+// ---- MP3 -----------------------------------------------------------------
+static size_t mp3_read_cb(PCMSource *s, void *drvbuf, size_t drvframes, void **out)
+{
+	drmp3 *m = (drmp3*)s->ctx;
+	*out = drvbuf;
+	if (s->out_format == SND_PCM_FORMAT_FLOAT_LE) {
+		return (size_t)drmp3_read_pcm_frames_f32(m, drvframes, (float*)drvbuf);
 	}
+	if (s->out_format == SND_PCM_FORMAT_S32_LE) {
+		// A FLOAT request that fell back to plughw's S32: decode S16 and widen
+		// in place, back to front (each s32 write only clobbers already-read s16).
+		size_t n = (size_t)drmp3_read_pcm_frames_s16(m, drvframes, (drmp3_int16*)drvbuf);
+		int16_t *s16 = (int16_t*)drvbuf;
+		int32_t *s32 = (int32_t*)drvbuf;
+		for (long i = (long)(n * s->ch) - 1; i >= 0; i--) s32[i] = (int32_t)s16[i] << 16;
+		return n;
+	}
+	return (size_t)drmp3_read_pcm_frames_s16(m, drvframes, (drmp3_int16*)drvbuf);
+}
 
-	AUDIO a;
-	if (AUDIO_init_auto(&a, dev, flac->sampleRate, flac->channels, FRAMES, 1, format)) {
-		drflac_close(flac);
+void play_mp3(char *name, int format, int flag)
+{
+	drmp3 mp3;
+	if (!drmp3_init_file(&mp3, name, NULL)) {
+		printf("Error: not a valid MP3 audio file!\n");
 		return;
 	}
 
-	CrosstalkCancel xtc;
-	init_crosstalk_cancellation(&xtc, flac->sampleRate, flac->channels);
+	Tags tags = {{0}};
+	read_id3v2(name, &tags);
+	// No duration/total for MP3: counting frames (drmp3_get_pcm_frame_count)
+	// decodes the entire file before playback starts. Progress shows elapsed.
+	print_now_playing("MP3", &tags, mp3.sampleRate, 0, mp3.channels, 0, 0);
 
-	// Pick decode function based on what ALSA actually agreed to, not what was requested.
-	// If we fell back from FLOAT_LE to S32_LE, decode as S32 directly.
-	// If format is S16 or the device accepted float, decode accordingly.
-	uint64_t (*func)(drflac* pFlac, drflac_uint64 framesToRead, void* pBufferOut);
-	if (a.actual_format == SND_PCM_FORMAT_FLOAT_LE) {
-		func = (uint64_t (*)(drflac *, drflac_uint64, void *))drflac_read_pcm_frames_f32;
-	} else if (a.actual_format == SND_PCM_FORMAT_S32_LE) {
-		func = (uint64_t (*)(drflac *, drflac_uint64, void *))drflac_read_pcm_frames_s32;
-	} else {
-		func = (uint64_t (*)(drflac *, drflac_uint64, void *))drflac_read_pcm_frames_s16;
+	PCMSource s = {
+		.read = mp3_read_cb, .ctx = &mp3,
+		.rate = mp3.sampleRate, .ch = mp3.channels,
+	};
+	play_pcm(&s, format, flag);
+	drmp3_uninit(&mp3);
+}
+
+// ---- Ogg Vorbis ----------------------------------------------------------
+typedef struct {
+	stb_vorbis *v;
+	short *buf;	// one full Vorbis frame; sized for the spec max block
+	int num_shorts;
+} OggSrc;
+
+static size_t ogg_read_cb(PCMSource *s, void *drvbuf, size_t drvframes, void **out)
+{
+	OggSrc *o = (OggSrc*)s->ctx;
+	int n = stb_vorbis_get_frame_short_interleaved(o->v, s->ch, o->buf, o->num_shorts);
+	if (n <= 0) return 0;
+	*out = o->buf;
+	return (size_t)n;
+}
+
+void play_ogg(char *name, int format, int flag)
+{
+	int error;
+	stb_vorbis *v = stb_vorbis_open_filename(name, &error, NULL);
+	if (!v) {
+		printf("Error: cannot open `%s`\n", name);
+		return;
+	}
+	Tags tags = {{0}};
+	stb_vorbis_comment vc = stb_vorbis_get_comment(v);
+	for (int i = 0; i < vc.comment_list_length; i++)
+		if (vc.comment_list[i]) tag_set_kv(&tags, vc.comment_list[i]);
+	print_now_playing("Ogg Vorbis", &tags, v->sample_rate, 0, v->channels,
+	                  (unsigned long)stb_vorbis_stream_length_in_samples(v), file_size(name));
+
+	// Spec-max Vorbis block is 8192 samples/channel; size for a whole frame so
+	// stb_vorbis never has to truncate (it silently drops what doesn't fit).
+	OggSrc o = { .v = v, .num_shorts = 8192 * v->channels };
+	o.buf = (short*)malloc(o.num_shorts * sizeof(short));
+	if (!o.buf) { stb_vorbis_close(v); return; }
+
+	PCMSource s = {
+		.read = ogg_read_cb, .ctx = &o,
+		.rate = v->sample_rate, .ch = v->channels,
+		.total_frames = stb_vorbis_stream_length_in_samples(v),
+	};
+	play_pcm(&s, 0, flag);	// stb_vorbis decodes S16 only
+	free(o.buf);
+	stb_vorbis_close(v);
+}
+
+// ---- WMA -----------------------------------------------------------------
+#define MAX_WMA_FRAME_LEN 4096
+#define MAX_WMA_SUBFRAMES 16
+#define MAX_PCM_BUFFER_SIZE (MAX_WMA_SUBFRAMES * MAX_WMA_FRAME_LEN * 8 * sizeof(short))  // 8 channels max, ~1MB safe
+
+typedef struct {
+	CodecContext *cc;
+	unsigned char *stream_pos;
+	int bytes_left;
+	short *sample_buf;
+	size_t pcm_buffer_size;
+} WmaSrc;
+
+static size_t wma_read_cb(PCMSource *s, void *drvbuf, size_t drvframes, void **out)
+{
+	WmaSrc *w = (WmaSrc*)s->ctx;
+	if (w->bytes_left <= 0) return 0;
+
+	int out_size = 0;
+	int frame_size = wma_decode_superframe(w->cc, w->sample_buf, &out_size,
+	                                       w->stream_pos, w->bytes_left);
+	if (frame_size <= 0 || out_size <= 0) {
+		fprintf(stderr, "Error: failed to decode WMA frame, frame_size=%d, out_size=%d, bytes_left=%d\n",
+		        frame_size, out_size, w->bytes_left);
+		return 0;
+	}
+	if (out_size > (int)w->pcm_buffer_size) {
+		fprintf(stderr, "Error: decoded output size %d exceeds buffer size %zu\n",
+		        out_size, w->pcm_buffer_size);
+		return 0;
+	}
+	int frames = out_size / (sizeof(short) * s->ch);
+	if (frames <= 0 || frames > MAX_WMA_FRAME_LEN * MAX_WMA_SUBFRAMES) {
+		fprintf(stderr, "Error: invalid frame count %d\n", frames);
+		return 0;
+	}
+	w->stream_pos += frame_size;
+	w->bytes_left -= frame_size;
+	*out = w->sample_buf;
+	return (size_t)frames;
+}
+
+void play_wma(char *name, int format, int flag)
+{
+	void *file_data = MAP_FAILED;
+	short *sample_buf = NULL;
+	CodecContext cc = {0};
+	int len = 0;
+
+	int fd = open(name, O_RDONLY);
+	if (fd < 0) {
+		perror("open");
+		return;
+	}
+	len = lseek(fd, 0, SEEK_END);
+	if (len <= 0) {
+		fprintf(stderr, "Error: invalid file size\n");
+		close(fd);
+		return;
+	}
+	lseek(fd, 0, SEEK_SET);
+	file_data = mmap(0, len, PROT_READ, MAP_PRIVATE, fd, 0);
+	close(fd);
+	if (file_data == MAP_FAILED) {
+		perror("mmap");
+		return;
 	}
 
-	int c = 0;
-	printf("\e[?25l");
-	size_t n; // numberOfSamplesActuallyDecoded
-	while ((n = func(flac, a.frames, (void*)a.buffer)) > 0) {
-		if (flag & USE_CROSSTALK) {
-			apply_crosstalk_cancellation(&xtc, a.buffer, n, flac->channels, format);
-		}
-		AUDIO_play(&a, a.buffer, n);
-		int k = key(&a);
-		if (k=='c') {
-			flag ^= USE_CROSSTALK;
-		} else if (k) {
-			break;
-		}
-
-		printf("\r%d/%llu", c, flac->totalPCMFrameCount);
-		c += n;
+	cc.priv_data = calloc(1, sizeof(WMADecodeContext));
+	if (!cc.priv_data) {
+		fprintf(stderr, "Error: failed to allocate WMA context\n");
+		goto cleanup;
 	}
-	printf("\e[?25h");
+	if (parse_wma_header((unsigned char*)file_data, len, &cc) != 0) {
+		fprintf(stderr, "Error: failed to parse WMA header\n");
+		goto cleanup;
+	}
+	WMADecodeContext *wctx = (WMADecodeContext *)cc.priv_data;
+	if (wma_decode_init_fixed(&cc) < 0) {
+		fprintf(stderr, "Error: failed to initialize WMA decoder\n");
+		goto cleanup;
+	}
 
-	AUDIO_close(&a);
-	drflac_close(flac);
-	free_crosstalk_cancellation(&xtc);
+	size_t pcm_buffer_size = wctx->nb_channels * wctx->frame_len * MAX_WMA_SUBFRAMES * sizeof(short);
+	if (pcm_buffer_size == 0 || pcm_buffer_size > MAX_PCM_BUFFER_SIZE ||
+	    wctx->nb_channels == 0 || wctx->frame_len == 0) {
+		fprintf(stderr, "Error: invalid PCM buffer parameters: nb_channels=%d, frame_len=%d, pcm_buffer_size=%zu\n",
+		        wctx->nb_channels, wctx->frame_len, pcm_buffer_size);
+		goto cleanup_decoder;
+	}
+	sample_buf = malloc(pcm_buffer_size);
+	if (!sample_buf) {
+		fprintf(stderr, "Error: failed to allocate PCM buffer of size %zu bytes\n", pcm_buffer_size);
+		goto cleanup_decoder;
+	}
+
+	Tags tags = {{0}};
+	read_asf_tags(name, &tags);
+	print_now_playing("WMA", &tags, cc.sample_rate, 0, cc.channels, 0, 0);
+
+	{
+		WmaSrc w = {
+			.cc = &cc, .stream_pos = (unsigned char*)file_data, .bytes_left = len,
+			.sample_buf = sample_buf, .pcm_buffer_size = pcm_buffer_size,
+		};
+		PCMSource s = {
+			.read = wma_read_cb, .ctx = &w,
+			.rate = cc.sample_rate, .ch = cc.channels,
+		};
+		play_pcm(&s, 0, flag);	// WMA decoder produces S16 only
+	}
+
+cleanup_decoder:
+	wma_decode_end(&cc);
+cleanup:
+	free(sample_buf);
+	free(cc.priv_data);
+	if (file_data != MAP_FAILED) munmap(file_data, len);
+}
+
+// ---- AAC / M4A -----------------------------------------------------------
+typedef struct {
+	HAACDecoder aac;
+	unsigned char *file_data, *stream_pos;
+	int bytes_left;
+	int samples_per_frame;	// per channel: 2048 with SBR, else 1024
+	short buf[AAC_BUF_SIZE * 2];
+} AacSrc;
+
+static size_t aac_read_cb(PCMSource *s, void *drvbuf, size_t drvframes, void **out)
+{
+	AacSrc *c = (AacSrc*)s->ctx;
+	if (c->bytes_left <= 0) return 0;
+	int r = AACDecode(c->aac, &c->stream_pos, &c->bytes_left, c->buf);
+	if (r) {
+		printf("\nAAC decode error %d\n", r);
+		// For raw AAC (MP4), do not attempt ADTS-based resync — just stop.
+		return 0;
+	}
+	*out = c->buf;
+	return (size_t)c->samples_per_frame;
+}
+
+void play_aac(char *name, int format, int flag)
+{
+	int fd = open(name, O_RDONLY);
+	if (fd < 0) {
+		printf("Error: cannot open `%s`\n", name);
+		return;
+	}
+
+	AacSrc *c = calloc(1, sizeof(AacSrc));
+	if (!c) { close(fd); return; }
+
+	int samplerate, channels, profile;
+	c->file_data = uaac_extract_aac(fd, &c->bytes_left, &samplerate, &channels, &profile);
+	close(fd);
+	if (!c->file_data) {
+		printf("Error: cannot read AAC data\n");
+		free(c);
+		return;
+	}
+	c->stream_pos = c->file_data;
+
+	Tags tags = {{0}};
+	read_mp4_tags(name, &tags);	// m4a/mp4 container tags (raw .aac has none)
+	print_tags(&tags);
+
+	AACFrameInfo info;
+	memset(&info, 0, sizeof(AACFrameInfo));
+	info.nChans = channels;
+	info.sampRateCore = samplerate;
+	info.profile = profile;
+
+	c->aac = AACInitDecoder();
+	AACSetRawBlockParams(c->aac, 0, &info);
+
+	int output_samplerate = samplerate;
+	int sbr_enabled = (profile == 5);
+	if (sbr_enabled) {
+		output_samplerate *= 2;
+	} else if (samplerate <= 24000) {
+		sbr_enabled = 1;
+		info.profile = 5;
+		output_samplerate *= 2;
+		printf("Assuming potential HE-AAC with SBR, output samplerate: %dHz\n", output_samplerate);
+	}
+	c->samples_per_frame = sbr_enabled ? 2048 : 1024;
+	printf("%dHz (output: %dHz) %dch\n", info.sampRateCore, output_samplerate, info.nChans);
+
+	PCMSource s = {
+		.read = aac_read_cb, .ctx = c,
+		.rate = output_samplerate, .ch = info.nChans,
+	};
+	play_pcm(&s, 0, flag);	// helix decoder produces S16 only
+
+	AACFreeDecoder(c->aac);
+	free(c->file_data);
+	free(c);
+}
+
+// ---- DSF (DSD) -----------------------------------------------------------
+static size_t dsf_read_cb(PCMSource *s, void *drvbuf, size_t drvframes, void **out)
+{
+	DSDDecoder *d = (DSDDecoder*)s->ctx;
+	*out = drvbuf;
+	return dsd_decoder_read_pcm_frames(d, drvframes, drvbuf, s->out_format);
 }
 
 void play_dsf(char *name, int format, int flag)
@@ -794,9 +771,8 @@ void play_dsf(char *name, int format, int flag)
 
 	// --- Try native DSD passthrough first (bit-perfect, no PCM conversion) ---
 	// Only attempt on hw:/plughw: devices and when the user hasn't forced PCM.
-	int is_hw = (strncmp(dev, "hw:", 3) == 0 || strncmp(dev, "plughw:", 7) == 0);
 	unsigned int native_rate = dsd_native_rate(decoder);
-	if (is_hw && !force_pcm_dsd &&
+	if (dev_is_hw_or_plug(dev) && !force_pcm_dsd &&
 	    AUDIO_supports_dsd(dev, SND_PCM_FORMAT_DSD_U32_BE, native_rate, decoder->channels)) {
 
 		printf("%dHz DSD %dch (native DSD_U32_BE @ %uHz)\n",
@@ -818,12 +794,15 @@ void play_dsf(char *name, int format, int flag)
 		}
 
 		// Native DSD passthrough is bit-perfect by definition (1-bit stream sent
-		// straight to the DAC; no conversion, and volume/crosstalk don't apply).
+		// straight to the DAC; no conversion, and crosstalk doesn't apply).
 		printf("%s\xe2\x97\x8f BIT PERFECT\e[0m %s(native DSD)\e[0m\n", theme.accent, theme.hint);
 		fflush(stdout);
 
 		uint64_t total_native = dsd_native_total_frames(decoder);
 		uint64_t frames_played = 0;
+		unsigned last_sec = (unsigned)-1;
+		char cur[16], tot[16];
+		fmt_duration(tot, sizeof tot, native_rate ? (double)total_native / native_rate : 0);
 		dsd_native_reset(decoder); // ensure clean start at data chunk
 		printf("\e[?25l");
 		size_t n;
@@ -832,10 +811,15 @@ void play_dsf(char *name, int format, int flag)
 			int k = key(&a);
 			if (k) break; // no crosstalk in native mode — it's a raw bitstream
 			frames_played += n;
-			printf("\r%lu/%lu", frames_played, total_native);
-			fflush(stdout);
+			unsigned sec = native_rate ? (unsigned)(frames_played / native_rate) : 0;
+			if (sec != last_sec) {
+				last_sec = sec;
+				fmt_duration(cur, sizeof cur, (double)sec);
+				printf("\r%s / %s\e[K", cur, tot);
+				fflush(stdout);
+			}
 		}
-		printf("\n\e[?25h");
+		printf("\e[?25h");
 
 		AUDIO_close(&a);
 		dsd_decoder_free(decoder);
@@ -846,461 +830,35 @@ void play_dsf(char *name, int format, int flag)
 	// --- Fallback: convert DSD to PCM ---
 	printf("%dHz %dch (DSD->PCM)\n", decoder->sample_rate_pcm, decoder->channels);
 
-	// DSF is always high-resolution — default to S32_LE unless user requested float.
-	if (!format) format = SND_PCM_FORMAT_S32_LE;
+	PCMSource s = {
+		.read = dsf_read_cb, .ctx = decoder,
+		.rate = decoder->sample_rate_pcm, .ch = decoder->channels,
+		.src_bits = 24,	// DSF is always high-resolution — default to S32_LE
+		.total_frames = decoder->totalPCMFrameCount,
+	};
+	play_pcm(&s, format, flag);
 
-	AUDIO a;
-	if (AUDIO_init_auto(&a, dev, decoder->sample_rate_pcm, decoder->channels, FRAMES, 1, format)) {
-		dsd_decoder_free(decoder);
-		fclose(f);
-		return;
-	}
-
-	CrosstalkCancel xtc;
-	init_crosstalk_cancellation(&xtc, decoder->sample_rate_pcm, decoder->channels);
-
-	uint64_t frames_played = 0;
-	printf("\e[?25l");
-	size_t n;
-	while ((n = dsd_decoder_read_pcm_frames(decoder, a.frames, a.buffer, format)) > 0) {
-		if (n != a.frames) {
-			printf("!");        // Can happen at the end of the file
-		}
-
-		if (flag & USE_CROSSTALK) {
-			apply_crosstalk_cancellation(&xtc, a.buffer, n, decoder->channels, format);
-		}
-
-		AUDIO_play(&a, a.buffer, n);
-
-		int k = key(&a);
-		if (k == 'c') {
-			flag ^= USE_CROSSTALK;
-		} else if (k) {
-			break;
-		}
-
-		frames_played += n;
-		printf("\r%lu/%lu", frames_played, decoder->totalPCMFrameCount);
-		fflush(stdout);
-	}
-	printf("\n\e[?25h");
-
-	AUDIO_close(&a);
 	dsd_decoder_free(decoder);
 	fclose(f);
-	free_crosstalk_cancellation(&xtc);
 }
 
-#ifdef DR_MP3_IMPLEMENTATION
-int play_mp3(char *name, int format, int flag)
+// ---- supported formats: ONE table drives play_file and the browser filter ----
+static const struct {
+	const char *ext;
+	void (*fn)(char *name, int format, int flag);
+} PLAYERS[] = {
+	{ "flac", play_flac }, { "mp3", play_mp3 }, { "mp4", play_aac },
+	{ "m4a", play_aac },   { "ogg", play_ogg }, { "wav", play_wav },
+	{ "wma", play_wma },   { "dsf", play_dsf },
+};
+#define N_PLAYERS ((int)(sizeof(PLAYERS) / sizeof(PLAYERS[0])))
+
+// Is this (lowercased) extension a playable audio format?
+static int is_supported_audio(const char *ext)
 {
-	drmp3 mp3;
-	if (!drmp3_init_file(&mp3, name, NULL)) {
-		printf("Error: not a valid MP3 audio file!\n");
-		return 1;
-	}
-
-	Tags tags = {{0}};
-	read_id3v2(name, &tags);	// title/artist/album from ID3v2 (no duration: too costly for MP3)
-	print_now_playing("MP3", &tags, mp3.sampleRate, 0, mp3.channels, 0, 0);
-	AUDIO a;
-	if (AUDIO_init_auto(&a, dev, mp3.sampleRate, mp3.channels, FRAMES, 1, format)) {
-		return 1;
-	}
-
-	CrosstalkCancel xtc;
-	init_crosstalk_cancellation(&xtc, mp3.sampleRate, mp3.channels);
-
-	uint64_t (*func)(drmp3*, drflac_uint64, void*);
-	if (format) {
-		func = (uint64_t (*)(drmp3 *, drflac_uint64, void *))drmp3_read_pcm_frames_f32;
-	} else {
-		func = (uint64_t (*)(drmp3 *, drflac_uint64, void *))drmp3_read_pcm_frames_s16;
-	}
-
-	int totalPCMFrameCount = drmp3_get_pcm_frame_count(&mp3);
-	int c = 0;
-	printf("\e[?25l");
-	size_t n;
-	while ((n = func(&mp3, a.frames, (drmp3_int16*)a.buffer)) > 0) {
-		if (flag & USE_CROSSTALK) {
-			apply_crosstalk_cancellation(&xtc, a.buffer, n, mp3.channels, format);
-		}
-		AUDIO_play(&a, a.buffer, n);
-		int k = key(&a);
-		if (k=='c') {
-			flag ^= USE_CROSSTALK;
-		} else if (k) {
-			break;
-		}
-
-		printf("\r%d/%d", c, totalPCMFrameCount);
-		c += n;
-	}
-	printf("\e[?25h");
-
-	AUDIO_close(&a);
-	drmp3_uninit(&mp3);
-	free_crosstalk_cancellation(&xtc);
+	for (int i = 0; i < N_PLAYERS; i++)
+		if (!strcasecmp(ext, PLAYERS[i].ext)) return 1;
 	return 0;
-}
-#else
-int play_mp3(char *name, int format, int flag)
-{
-	short sample_buf[MP3_MAX_SAMPLES_PER_FRAME];
-	int len;
-	void *file_data = preload(name, &len);
-	unsigned char *stream_pos = (unsigned char *)file_data;
-	int bytes_left = len - 100;
-
-	mp3_info_t info;
-	mp3_decoder_t mp3 = mp3_create();
-	int frame_size = mp3_decode(mp3, stream_pos, bytes_left, sample_buf, &info);
-	if (!frame_size) {
-		printf("Error: not a valid MP3 audio file!\n");
-		munmap(file_data, len);
-		return 1;
-	}
-
-	printf("%dHz %dch\n", info.sample_rate, info.channels);
-	AUDIO a;
-	if (AUDIO_init_auto(&a, dev, info.sample_rate, info.channels, FRAMES, 1, 0)) {
-		munmap(file_data, len);
-		return 1;
-	}
-
-	CrosstalkCancel xtc;
-	if (flag & USE_CROSSTALK) {
-		init_crosstalk_cancellation(&xtc, info.sample_rate, info.channels);
-	}
-
-	int c = 0;
-	printf("\e[?25l");
-	while ((bytes_left >= 0) && (frame_size > 0) && !key(&a)) {
-		printf("\r%d", c);
-
-		if (flag & USE_CROSSTALK) {
-			apply_crosstalk_cancellation(&xtc, sample_buf, info.audio_bytes/2/info.channels, info.channels, 0);
-		}
-		stream_pos += frame_size;
-		bytes_left -= frame_size;
-		AUDIO_play(&a, (char*)sample_buf, info.audio_bytes/2/info.channels);
-
-
-		c += frame_size;
-		frame_size = mp3_decode(mp3, stream_pos, bytes_left, sample_buf, NULL);
-	}
-	printf("\e[?25h");
-
-	AUDIO_close(&a);
-	mp3_free(mp3);
-	munmap(file_data, len);
-	if (flag & USE_CROSSTALK) {
-		free_crosstalk_cancellation(&xtc);
-	}
-	return 0;
-}
-#endif
-
-void play_ogg(char *name, int flag)
-{
-	int n, error;
-	short outputs[FRAMES*2*100];
-
-	stb_vorbis *v = stb_vorbis_open_filename(name, &error, NULL);
-	if (!v) {
-		printf("Error: cannot open `%s`\n", name);
-		return;
-	}
-	Tags tags = {{0}};
-	stb_vorbis_comment vc = stb_vorbis_get_comment(v);
-	for (int i = 0; i < vc.comment_list_length; i++)
-		if (vc.comment_list[i]) tag_set_kv(&tags, vc.comment_list[i]);
-	struct stat os;
-	long osz = (stat(name, &os) == 0) ? (long)os.st_size : 0;
-	print_now_playing("Ogg Vorbis", &tags, v->sample_rate, 0, v->channels,
-	                  (unsigned long)stb_vorbis_stream_length_in_samples(v), osz);
-
-	AUDIO a;
-	if (AUDIO_init_auto(&a, dev, v->sample_rate, v->channels, FRAMES*2, 1, 0)) {
-		stb_vorbis_close(v);
-		return;
-	}
-
-	CrosstalkCancel xtc;
-	init_crosstalk_cancellation(&xtc, v->sample_rate, v->channels);
-
-	int c = 0;
-	printf("\e[?25l");
-	while ((n = stb_vorbis_get_frame_short_interleaved(v, v->channels, outputs, FRAMES*100))) {
-		printf("\r%d", c);
-		if (flag & USE_CROSSTALK) {
-			apply_crosstalk_cancellation(&xtc, outputs, n, v->channels, 0);
-		}
-		AUDIO_play(&a, (char*)outputs, n);
-		int k = key(&a);
-		if (k=='c') {
-			flag ^= USE_CROSSTALK;
-		} else if (k) {
-			break;
-		}
-		c += n;
-	}
-	printf("\e[?25h");
-
-	AUDIO_close(&a);
-	stb_vorbis_close(v);
-	free_crosstalk_cancellation(&xtc);
-}
-
-#define MAX_WMA_FRAME_LEN 4096
-#define MAX_WMA_SUBFRAMES 16
-#define MAX_PCM_BUFFER_SIZE (MAX_WMA_SUBFRAMES * MAX_WMA_FRAME_LEN * 8 * sizeof(short))  // 8 channels max, ~1MB safe
-int play_wma(char *name, int flag)
-{
-	void *file_data = NULL;
-	unsigned char *stream_pos;
-	short *sample_buf = NULL;
-	int bytes_left;
-
-	int fd = open(name, O_RDONLY);
-	if (fd < 0) {
-		perror("open");
-		return 1;
-	}
-
-	int len = lseek(fd, 0, SEEK_END);
-	if (len <= 0) {
-		fprintf(stderr, "Error: invalid file size\n");
-		close(fd);
-		return 1;
-	}
-
-	lseek(fd, 0, SEEK_SET);
-	file_data = mmap(0, len, PROT_READ, MAP_PRIVATE, fd, 0);
-	close(fd);
-	if (file_data == MAP_FAILED) {
-		perror("mmap");
-		return 1;
-	}
-
-	stream_pos = (unsigned char *)file_data;
-	bytes_left = len;
-
-	CodecContext cc = {0};
-	cc.priv_data = calloc(1, sizeof(WMADecodeContext));
-	if (!cc.priv_data) {
-		fprintf(stderr, "Error: failed to allocate WMA context\n");
-		munmap(file_data, len);
-		return 1;
-	}
-
-	if (parse_wma_header(stream_pos, bytes_left, &cc) != 0) {
-		fprintf(stderr, "Error: failed to parse WMA header\n");
-		munmap(file_data, len);
-		free(cc.priv_data);
-		return 1;
-	}
-
-	WMADecodeContext *s = (WMADecodeContext *)cc.priv_data;
-	if (wma_decode_init_fixed(&cc) < 0) {
-		fprintf(stderr, "Error: failed to initialize WMA decoder\n");
-		munmap(file_data, len);
-		free(cc.priv_data);
-		return 1;
-	}
-
-	size_t pcm_buffer_size = s->nb_channels * s->frame_len * MAX_WMA_SUBFRAMES * sizeof(short);
-	if (pcm_buffer_size == 0 || pcm_buffer_size > MAX_PCM_BUFFER_SIZE || s->nb_channels == 0 || s->frame_len == 0) {
-		fprintf(stderr, "Error: invalid PCM buffer parameters: nb_channels=%d, frame_len=%d, pcm_buffer_size=%zu\n",
-		        s->nb_channels, s->frame_len, pcm_buffer_size);
-		wma_decode_end(&cc);
-		munmap(file_data, len);
-		free(cc.priv_data);
-		return 1;
-	}
-
-	sample_buf = malloc(pcm_buffer_size);
-	if (!sample_buf) {
-		fprintf(stderr, "Error: failed to allocate PCM buffer of size %zu bytes\n", pcm_buffer_size);
-		wma_decode_end(&cc);
-		munmap(file_data, len);
-		free(cc.priv_data);
-		return 1;
-	}
-
-	Tags tags = {{0}};
-	read_asf_tags(name, &tags);
-	print_now_playing("WMA", &tags, cc.sample_rate, 0, cc.channels, 0, 0);
-	AUDIO a;
-	if (AUDIO_init_auto(&a, dev, cc.sample_rate, cc.channels, FRAMES, 1, 0)) {
-		fprintf(stderr, "Error: failed to initialize audio\n");
-		wma_decode_end(&cc);
-		munmap(file_data, len);
-		free(sample_buf);
-		free(cc.priv_data);
-		return 1;
-	}
-
-	CrosstalkCancel xtc;
-	init_crosstalk_cancellation(&xtc, cc.sample_rate, cc.channels);
-
-	printf("\e[?25l");
-	while (bytes_left > 0) {
-		int out_size = 0;
-		int frame_size = wma_decode_superframe(&cc, sample_buf, &out_size, stream_pos, bytes_left);
-		if (frame_size <= 0 || out_size <= 0) {
-			fprintf(stderr, "Error: failed to decode WMA frame, frame_size=%d, out_size=%d, bytes_left=%d\n",
-			        frame_size, out_size, bytes_left);
-			break;
-		}
-
-		if (out_size > (int)pcm_buffer_size) {
-			fprintf(stderr, "Error: decoded output size %d exceeds buffer size %zu\n", out_size, pcm_buffer_size);
-			break;
-		}
-
-		int frames = out_size / (sizeof(short) * cc.channels);
-		if (frames <= 0 || frames > MAX_WMA_FRAME_LEN || cc.channels == 0) {
-			fprintf(stderr, "Error: invalid frame count %d, channels=%d\n", frames, cc.channels);
-			break;
-		}
-
-		if (flag & USE_CROSSTALK) {
-			if (!sample_buf) {
-				fprintf(stderr, "Error: sample_buf is NULL\n");
-				break;
-			}
-			apply_crosstalk_cancellation(&xtc, sample_buf, frames, cc.channels, 0);
-		}
-
-		AUDIO_play(&a, (char*)sample_buf, frames);
-
-		stream_pos += frame_size;
-		bytes_left -= frame_size;
-
-		int k = key(&a);
-		if (k == 'c') {
-			flag ^= USE_CROSSTALK;
-		} else if (k) {
-			break;
-		}
-
-		printf("\r%d/%d", len - bytes_left, len);
-		fflush(stdout);
-	}
-	printf("\n\e[?25h");
-
-	AUDIO_close(&a);
-	wma_decode_end(&cc);
-	munmap(file_data, len);
-	free(sample_buf);
-	free(cc.priv_data);
-	free_crosstalk_cancellation(&xtc);
-	return 0;
-}
-
-int play_aac(char *name, int flag)
-{
-    unsigned char *file_data;
-    unsigned char *stream_pos;
-    short sample_buf[AAC_BUF_SIZE * 2];
-    int bytes_left;
-
-    int fd = open(name, O_RDONLY);
-    if (fd < 0) {
-        printf("Error: cannot open `%s`\n", name);
-        return 1;
-    }
-
-    int samplerate, channels, profile;
-    file_data = uaac_extract_aac(fd, &bytes_left, &samplerate, &channels, &profile);
-    if (!file_data) {
-        printf("Error: cannot read AAC data\n");
-        close(fd);
-        return 1;
-    }
-    stream_pos = file_data;
-
-    Tags tags = {{0}};
-    read_mp4_tags(name, &tags);	// m4a/mp4 container tags (raw .aac has none)
-    print_tags(&tags);
-
-    AACFrameInfo info;
-    memset(&info, 0, sizeof(AACFrameInfo));
-    info.nChans = channels;
-    info.sampRateCore = samplerate;
-    info.profile = profile;
-
-    HAACDecoder aac = AACInitDecoder();
-    AACSetRawBlockParams(aac, 0, &info);
-
-    int output_samplerate = samplerate;
-    int sbr_enabled = (profile == 5);
-    if (sbr_enabled) {
-        output_samplerate *= 2;
-    } else if (samplerate <= 24000) {
-        sbr_enabled = 1;
-        info.profile = 5;
-        output_samplerate *= 2;
-        printf("Assuming potential HE-AAC with SBR, output samplerate: %dHz\n", output_samplerate);
-    }
-    printf("%dHz (output: %dHz) %dch\n", info.sampRateCore, output_samplerate, info.nChans);
-
-    AUDIO a;
-    if (AUDIO_init_auto(&a, dev, output_samplerate, info.nChans, FRAMES, 1, 0)) {
-        printf("Error: failed to initialize ALSA with %dHz, %dch\n", output_samplerate, info.nChans);
-        free(file_data);
-        close(fd);
-        AACFreeDecoder(aac);
-        return 1;
-    }
-
-    CrosstalkCancel xtc;
-    init_crosstalk_cancellation(&xtc, output_samplerate, info.nChans);
-
-    printf("\e[?25l");
-    while (bytes_left > 0) {
-        int r = AACDecode(aac, &stream_pos, &bytes_left, sample_buf);
-        if (verbose) {
-            printf("\rDecoded %d bytes, %d bytes left, result=%d\n", (int)(stream_pos - file_data), bytes_left, r);
-        } else {
-            printf("\r%d/%d", (int)(stream_pos - file_data), bytes_left + (int)(stream_pos - file_data));
-        }
-        if (!r) {
-            AACGetLastFrameInfo(aac, &info);
-            int samples_per_frame = sbr_enabled ? 2048 : 1024; // Samples per channel
-            if (verbose) {
-                printf("Frame: %d samples/channel, %d channels, %dHz\n", samples_per_frame, info.nChans, info.sampRateCore);
-            }
-            int frames = samples_per_frame; // Samples per channel
-            if (flag & USE_CROSSTALK) {
-                apply_crosstalk_cancellation(&xtc, sample_buf, frames, info.nChans, 0);
-            }
-            AUDIO_play(&a, (char*)sample_buf, frames);
-        } else {
-            printf("\nAAC decode error %d\n", r);
-            // For raw AAC (MP4), do not attempt ADTS-based resync—just stop on error.
-            // If this is an ADTS file (.aac), you could add conditional resync logic here.
-            break;
-        }
-
-        int k = key(&a);
-        if (k == 'c') {
-            flag ^= USE_CROSSTALK;
-        } else if (k) {
-            break;
-        }
-    }
-    printf("\e[?25h");
-
-    AUDIO_close(&a);
-    AACFreeDecoder(aac);
-    free(file_data);
-    close(fd);
-    free_crosstalk_cancellation(&xtc);
-    return 0;
 }
 
 // Play a single file by extension. Returns 1 if the file was recognised and
@@ -1308,34 +866,16 @@ int play_aac(char *name, int flag)
 int play_file(char *path, int format, int flag)
 {
 	char *e = findExt(path);
-
-	// Only announce playback (and key hints) for files we can actually play —
-	// skip silently for cover art and other non-audio files in a directory.
-	int supported = !strcasecmp(e, "flac") || !strcasecmp(e, "mp3") ||
-	                !strcasecmp(e, "mp4")  || !strcasecmp(e, "m4a") ||
-	                !strcasecmp(e, "ogg")  || !strcasecmp(e, "wav") ||
-	                !strcasecmp(e, "wma")  || !strcasecmp(e, "dsf");
-	if (!supported) return 0;
-	printf("%s[ p prev  n next  space pause  q quit ]\e[0m\n", theme.hint);
-
-	if (!strcasecmp(e, "flac")) {
-		play_flac(path, format, flag);
-	} else if (!strcasecmp(e, "mp3")) {
-		play_mp3(path, format, flag);
-	} else if (!strcasecmp(e, "mp4") || !strcasecmp(e, "m4a")) {
-		play_aac(path, flag);
-	} else if (!strcasecmp(e, "ogg")) {
-		play_ogg(path, flag);
-	} else if (!strcasecmp(e, "wav")) {
-		play_wav(path, format, flag);
-	} else if (!strcasecmp(e, "wma")) {
-		play_wma(path, flag);
-	} else if (!strcasecmp(e, "dsf")) {
-		play_dsf(path, format, flag);
-	} else {
-		return 0;
+	for (int i = 0; i < N_PLAYERS; i++) {
+		if (!strcasecmp(e, PLAYERS[i].ext)) {
+			// Announce playback (and key hints) only for files we can play —
+			// stay silent for cover art and other non-audio directory entries.
+			printf("%s[ p prev  n next  space pause  q quit ]\e[0m\n", theme.hint);
+			PLAYERS[i].fn(path, format, flag);
+			return 1;
+		}
 	}
-	return 1;
+	return 0;
 }
 
 // Play a directory. If `start` is non-NULL, the first pass begins at the track
@@ -1343,9 +883,21 @@ int play_file(char *path, int format, int flag)
 // later loop_mode passes play the whole directory.
 void play_dir(char *name, char *type, char *regexp, int flag, const char *start)
 {
-	char path[1024];
+	char path[PATH_MAX];
 	int num=0, back=-1;	// so prev on the very first track replays it, not advances
 	int format = flag & USE_FLOAT32 ? SND_PCM_FORMAT_FLOAT_LE : 0;
+
+	// Compile the filter regex ONCE (it used to be recompiled — and leaked —
+	// for every track on every pass).
+	Reprog *prog = NULL;
+	if (regexp) {
+		const char *error;
+		prog = regcomp(regexp, REG_ICASE, &error);
+		if (!prog) {
+			fprintf(stderr, "regcomp: %s\n", error);
+			return;
+		}
+	}
 
 	do {
 		LS_LIST *ls = ls_dir(name, flag, &num);
@@ -1353,22 +905,15 @@ void play_dir(char *name, char *type, char *regexp, int flag, const char *start)
 		int played_count = 0;
 		int started = (start == NULL);	// skip tracks until we reach `start`
 		for (int i=0; i<num; i++) {
-			if (i < 0 || ls[i].d_name[0] == 0) continue;	// skip empty/padding slots
 			char *e = findExt(ls[i].d_name);
 			if (type) {
 				if (strcasecmp(e, type)) {
 					continue;
 				}
 			}
-			if (regexp) {
-				const char *error;
-				Reprog *p = regcomp(regexp, REG_ICASE, &error);
-				if (!p) {
-					fprintf(stderr, "regcomp: %s\n", error);
-					return;
-				}
+			if (prog) {
 				Resub m;
-				if (regexec(p, ls[i].d_name, &m, 0)) {
+				if (regexec(prog, ls[i].d_name, &m, 0)) {
 					continue;
 				}
 			}
@@ -1383,7 +928,7 @@ void play_dir(char *name, char *type, char *regexp, int flag, const char *start)
 			}
 
 			printf("%s%s%s\e[0m\n", played_count > 0 ? "\n" : "", theme.playing, ls[i].d_name);
-			snprintf(path, 1024, "%s", ls[i].d_name);
+			snprintf(path, sizeof(path), "%s", ls[i].d_name);
 			if (access(ls[i].d_name, F_OK)<0) {
 				continue;
 			}
@@ -1414,6 +959,8 @@ void play_dir(char *name, char *type, char *regexp, int flag, const char *start)
 		free(ls);
 		start = NULL;	// subsequent loop_mode passes play the whole directory
 	} while (loop_mode);
+
+	if (prog) regfree(prog);
 }
 
 // Play an .m3u/.m3u8 playlist: one file path per line, '#' lines are comments.
@@ -1823,8 +1370,9 @@ int select_alsa_device(char *out, size_t n)
 
 	// Mark the currently-saved device, if any, and make it the Enter default.
 	char current[64];
+	int have_cur = config_load_device(current, sizeof(current));
 	int current_idx = -1;
-	if (config_load_device(current, sizeof(current))) {
+	if (have_cur) {
 		for (int i = 0; i < count; i++) {
 			if (!strcmp(devs[i].dev, current)) { current_idx = i; break; }
 		}
@@ -1837,62 +1385,18 @@ int select_alsa_device(char *out, size_t n)
 		        i + 1, devs[i].dev, devs[i].name, devs[i].rates,
 		        (i == current_idx) ? "  \xe2\x86\x90 current" : "");
 	}
-	if (current_idx < 0 && config_load_device(current, sizeof(current))) {
+	if (current_idx < 0 && have_cur) {
 		fprintf(stderr, "\n  (saved device '%s' is not currently available)\n", current);
 	}
 	fprintf(stderr, "\nEnter number [1-%d], Enter for %d, Esc or q to cancel: ", count, def);
 	fflush(stderr);
 
-	// Raw, no-echo input: we echo digits ourselves so Esc/arrow keys don't spew
-	// escape characters, and we can cancel cleanly.
-	struct termios old, raw;
-	tcgetattr(0, &old);
-	raw = old;
-	raw.c_lflag &= ~(ICANON | ECHO);
-	raw.c_cc[VMIN] = 1;
-	raw.c_cc[VTIME] = 0;
-	tcsetattr(0, TCSANOW, &raw);
-
-	char buf[8];
-	int len = 0, cancelled = 0;
-	for (;;) {
-		unsigned char ch;
-		if (read(0, &ch, 1) <= 0) { cancelled = 1; break; }
-		if (ch == '\r' || ch == '\n') break;
-		if (ch == 'q' || ch == 'Q') { cancelled = 1; break; }
-		if (ch == 27) {	// Esc, or the lead byte of an arrow key — cancel
-			// Drain any remaining escape-sequence bytes so they don't leak.
-			struct termios drain = raw;
-			drain.c_cc[VMIN] = 0;
-			drain.c_cc[VTIME] = 1;
-			tcsetattr(0, TCSANOW, &drain);
-			unsigned char junk;
-			while (read(0, &junk, 1) > 0) {}
-			cancelled = 1;
-			break;
-		}
-		if ((ch == 127 || ch == 8) && len > 0) {	// backspace
-			len--;
-			fprintf(stderr, "\b \b");
-			fflush(stderr);
-			continue;
-		}
-		if (ch >= '0' && ch <= '9' && len < (int)sizeof(buf) - 1) {
-			buf[len++] = (char)ch;
-			fputc(ch, stderr);
-			fflush(stderr);
-		}
-	}
-	tcsetattr(0, TCSANOW, &old);
-	fprintf(stderr, "\n");
-
-	if (cancelled) {
+	int choice = read_menu_choice(count, def);
+	if (choice == 0) {
 		fprintf(stderr, "cancelled — keeping current device.\n");
 		return 0;
 	}
-	buf[len] = 0;
-	int choice = (len == 0) ? def : atoi(buf);
-	if (choice < 1 || choice > count) {
+	if (choice < 0) {
 		fprintf(stderr, "invalid selection.\n");
 		return 0;
 	}
@@ -1907,6 +1411,20 @@ int select_alsa_device(char *out, size_t n)
 // return, exit(), or a signal such as Ctrl-C during playback (where ISIG is on).
 static struct termios g_term_orig;
 static int g_term_saved = 0;
+
+// Non-canonical, no-echo mode for direct (non-browser) playback so key()'s
+// p/n/space/q register immediately. ISIG stays on so Ctrl-C works; the atexit
+// handler restores the original state. (kbhit() no longer mutates termios.)
+static void term_playback_mode(void)
+{
+	if (!g_term_saved) return;
+	struct termios t = g_term_orig;
+	t.c_lflag &= ~(ICANON | ECHO);
+	t.c_lflag |= ISIG;
+	t.c_cc[VMIN] = 1;
+	t.c_cc[VTIME] = 0;
+	tcsetattr(0, TCSANOW, &t);
+}
 static void term_cleanup(void)
 {
 	if (g_alt_active) (void)!write(1, "\e[?25h\e[?1049l", 14);
@@ -1955,7 +1473,6 @@ void usage(FILE* fp, int argc, char** argv)
 	        "-p                 Linux platform optimizations (needs root)\n"
 	        "-l                 Loop the directory playlist\n"
 	        "-v                 Verbose mode\n"
-	        "-V <volume>        Software volume, 0.0-1.0 (default 1.0)\n"
 	        "-P                 Force DSD->PCM conversion (default: native DSD if supported)\n"
 	        "-c                 Enable crosstalk cancellation\n"
 	        "-D <metres>        Speaker distance for crosstalk (default 0.5)\n"
@@ -1999,7 +1516,7 @@ int main(int argc, char *argv[])
 	theme_load();	// apply ~/.config/aplay+/theme if present
 
 	parg_init(&ps);
-	while ((c = parg_getopt(&ps, argc, argv, "hd:frxs:t:pclvD:TV:LPnS")) != -1) {
+	while ((c = parg_getopt(&ps, argc, argv, "hd:frxs:t:pclvD:TLPnS")) != -1) {
 		switch (c) {
 		case 1: {
 			// Expand leading ~ to $HOME
@@ -2077,12 +1594,6 @@ int main(int argc, char *argv[])
 		case 'v':
 			verbose = 1;
 			break;
-		case 'V':
-			volume = ps.optarg ? atof(ps.optarg) : 1.0f;
-			if (volume < 0.0f || volume > 1.0f) {
-				volume = 1.0f;
-			}
-			break;
 		case 'D':
 			speaker_distance_m = ps.optarg ? atof(ps.optarg) : speaker_distance_m;
 			break;
@@ -2092,7 +1603,7 @@ int main(int argc, char *argv[])
 		case 'h':
 			usage(stderr, argc, argv);
 			list_alsa_devices();
-			return 1;
+			return 0;
 		}
 	}
 
@@ -2118,14 +1629,14 @@ int main(int argc, char *argv[])
 	}
 
 	if (flag & USE_TEST_MODE) {
+		term_playback_mode();	// raw keys for the test-mode controls
 		int format = flag & USE_FLOAT32 ? SND_PCM_FORMAT_FLOAT_LE : 0;
 		play_test_mode(format, flag);
 	} else {
 		// Before starting playback, check once whether the device will silently
 		// resample. Use 96000Hz as the probe rate since that's the most common
 		// hi-res rate and the one most likely to be resampled by PipeWire.
-		int is_hw = (strncmp(dev, "hw:", 3) == 0 || strncmp(dev, "plughw:", 7) == 0);
-		if (!is_hw && device_will_silently_resample(dev, 96000)) {
+		if (!dev_is_hw_or_plug(dev) && device_will_silently_resample(dev, 96000)) {
 			fprintf(stderr,
 			        "\nerror: '%s' will silently resample audio to its internal clock rate.\n"
 			        "       This produces corrupted (static) output. Options:\n"
@@ -2151,6 +1662,7 @@ int main(int argc, char *argv[])
 		struct stat st;
 		if (legacy_mode) {
 			// -n: direct playback, no browser
+			term_playback_mode();	// raw keys for p/n/space/q during playback
 			char *de = findExt(dir);
 			if (!strcasecmp(de, "m3u") || !strcasecmp(de, "m3u8")) {
 				play_m3u(dir, flag);

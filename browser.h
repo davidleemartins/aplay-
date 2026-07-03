@@ -8,6 +8,7 @@
  *
  * Depends (from aplay+.c, include this header AFTER they are defined):
  *	void play_dir(char *name, char *type, char *regexp, int flag, const char *start);
+ *	int  is_supported_audio(const char *ext);
  *	int  select_alsa_device(char *out, size_t n);
  *	void config_save_device(const char *dev);
  *	char *dev;  (global current device)
@@ -50,17 +51,12 @@ static int br_is_playlist(const char *name)
 	return !strcasecmp(dot + 1, "m3u") || !strcasecmp(dot + 1, "m3u8");
 }
 
-/* ---- audio-file filter (mirror play_file's supported extensions) ---- */
+/* ---- audio-file filter: same PLAYERS table play_file dispatches from ---- */
 static int br_is_audio(const char *name)
 {
 	const char *dot = strrchr(name, '.');
 	if (!dot) return 0;
-	const char *e = dot + 1;
-	return !strcasecmp(e, "flac") || !strcasecmp(e, "mp3") ||
-	       !strcasecmp(e, "mp4")  || !strcasecmp(e, "m4a") ||
-	       !strcasecmp(e, "ogg")  || !strcasecmp(e, "wav") ||
-	       !strcasecmp(e, "wma")  || !strcasecmp(e, "dsf") ||
-	       br_is_playlist(name);
+	return is_supported_audio(dot + 1) || br_is_playlist(name);
 }
 
 /* ---- per-directory model (non-recursive; dirs first, then files) ---- */
@@ -78,18 +74,31 @@ static BR_ENTRY *br_read(const char *path, int *count)
 
 	int cap = 64, n = 0;
 	BR_ENTRY *e = malloc(cap * sizeof(BR_ENTRY));
+	if (!e) { closedir(dp); *count = 0; return NULL; }
 	struct dirent *d;
 	while ((d = readdir(dp))) {
 		if (d->d_name[0] == '.') continue;	// skip ., .. and dotfiles
 
-		char full[PATH_MAX];
-		snprintf(full, sizeof full, "%s/%s", path, d->d_name);
-		struct stat st;
-		int isdir = (stat(full, &st) == 0) && S_ISDIR(st.st_mode);
+		// Prefer d_type (no stat per entry — big dirs on spinning disks);
+		// fall back to stat for filesystems without it and for symlinks.
+		int isdir;
+		if (d->d_type != DT_UNKNOWN && d->d_type != DT_LNK) {
+			isdir = (d->d_type == DT_DIR);
+		} else {
+			char full[PATH_MAX];
+			snprintf(full, sizeof full, "%s/%s", path, d->d_name);
+			struct stat st;
+			isdir = (stat(full, &st) == 0) && S_ISDIR(st.st_mode);
+		}
 
 		if (!isdir && !br_is_audio(d->d_name)) continue;	// only dirs + audio
 
-		if (n == cap) { cap *= 2; e = realloc(e, cap * sizeof(BR_ENTRY)); }
+		if (n == cap) {
+			BR_ENTRY *ne = realloc(e, cap * 2 * sizeof(BR_ENTRY));
+			if (!ne) break;	// keep what we have
+			e = ne;
+			cap *= 2;
+		}
 		snprintf(e[n].name, sizeof e[n].name, "%s", d->d_name);
 		e[n].is_dir = isdir;
 		n++;
